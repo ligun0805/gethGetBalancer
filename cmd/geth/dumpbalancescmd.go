@@ -6,13 +6,12 @@ import (
 	"os"
 	"sort"
 
-	"github.com/urfave/cli/v2"
-
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/urfave/cli/v2"
 )
 
 var dumpBalancesCommand = &cli.Command{
@@ -26,8 +25,8 @@ var dumpBalancesCommand = &cli.Command{
 }
 
 func init() {
-	commands = append(commands, dumpBalancesCommand)
-	sort.Sort(cli.CommandsByName(commands))
+	app.Commands = append(app.Commands, dumpBalancesCommand)
+	sort.Sort(cli.CommandsByName(app.Commands))
 }
 
 func dumpBalances(ctx *cli.Context) error {
@@ -36,7 +35,9 @@ func dumpBalances(ctx *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("node.New failed: %w", err)
 	}
-	ethCfg := &eth.Config{NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name)}
+	ethCfg := &eth.Config{
+		NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name),
+	}
 	service, err := eth.New(stack, ethCfg)
 	if err != nil {
 		return fmt.Errorf("eth.New failed: %w", err)
@@ -47,7 +48,7 @@ func dumpBalances(ctx *cli.Context) error {
 	}
 	defer stack.Close()
 
-	header := service.BlockChain().Header()
+	header := service.BlockChain().CurrentHeader()
 	root := header.Root
 
 	stateDB, err := service.BlockChain().StateAt(root)
@@ -85,11 +86,12 @@ func dumpBalances(ctx *cli.Context) error {
 		return fmt.Errorf("cannot create file: %w", err)
 	}
 	defer f.Close()
+
 	for _, e := range list {
 		ethVal := new(big.Float).Quo(new(big.Float).SetInt(e.bal), big.NewFloat(1e18))
 		fmt.Fprintf(f, "%s\t%.6f\n", e.addr.Hex(), ethVal)
 	}
 
-	fmt.Println("✅ Dump completed: addresses_balances.txt")
+	fmt.Println("✅ addresses_balances.txt created")
 	return nil
 }
