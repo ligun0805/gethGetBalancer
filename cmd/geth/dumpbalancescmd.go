@@ -35,9 +35,7 @@ func dumpBalances(ctx *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("node.New failed: %w", err)
 	}
-	ethCfg := &eth.Config{
-		NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name),
-	}
+	ethCfg := &eth.Config{NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name)}
 	service, err := eth.New(stack, ethCfg)
 	if err != nil {
 		return fmt.Errorf("eth.New failed: %w", err)
@@ -92,6 +90,6 @@ func dumpBalances(ctx *cli.Context) error {
 		fmt.Fprintf(f, "%s\t%.6f\n", e.addr.Hex(), ethVal)
 	}
 
-	fmt.Println("✅ addresses_balances.txt created")
+	fmt.Println("✅ Dump completed: addresses_balances.txt")
 	return nil
 }
