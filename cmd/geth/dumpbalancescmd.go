@@ -8,9 +8,8 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/ethereum/go-ethereum/cmd/utils"
+	"github.com/ethereum/go-ethereum/cmd/geth/utils"
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/node"
@@ -22,14 +21,13 @@ var dumpBalancesCommand = &cli.Command{
 	Flags: []cli.Flag{
 		utils.DataDirFlag,
 		utils.NetworkIdFlag,
-		utils.SyncModeFlag,
 	},
 	Action: dumpBalances,
 }
 
 func init() {
-	commands = append(commands, dumpBalancesCommand)
-	sort.Sort(cli.CommandsByName(commands))
+	Commands = append(Commands, dumpBalancesCommand)
+	sort.Sort(cli.CommandsByName(Commands))
 }
 
 func dumpBalances(ctx *cli.Context) error {
@@ -40,7 +38,6 @@ func dumpBalances(ctx *cli.Context) error {
 	}
 	ethCfg := &eth.Config{
 		NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name),
-		SyncMode:  core.SyncMode(ctx.String(utils.SyncModeFlag.Name)),
 	}
 	ethService, err := eth.New(stack, ethCfg)
 	if err != nil {
@@ -54,7 +51,7 @@ func dumpBalances(ctx *cli.Context) error {
 
 	chain := ethService.BlockChain()
 	head := chain.CurrentBlock()
-	root := head.Header().Root
+	root := head.StateRoot()
 
 	stateDB, err := chain.StateAt(root)
 	if err != nil {
