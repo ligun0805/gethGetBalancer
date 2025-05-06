@@ -95,7 +95,6 @@ func connectEthereum(dataDir string, networkID uint64) (*node.Node, *eth.Ethereu
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to create eth service: %w", err)
 	}
-	stack.RegisterLifecycle(service)
 
 	if err := stack.Start(); err != nil {
 		return nil, nil, fmt.Errorf("failed to start node: %w", err)
@@ -124,7 +123,6 @@ func fetchBalances(stateDB *state.StateDB, verbose bool) ([]accountEntry, error)
 
 	var entries []accountEntry
 	processedCount := 0
-	// Здесь убрали addrStr, чтобы не было “declared and not used”
 	for _, acc := range dump.Accounts {
 		processedCount++
 		if acc.Address == nil {
