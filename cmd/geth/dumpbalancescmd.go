@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
 	"sort"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
@@ -16,10 +17,20 @@ import (
 
 var dumpBalancesCommand = &cli.Command{
 	Name:  "dump-balances",
-	Usage: "Export all non-zero accounts from current state to addresses_balances.txt",
+	Usage: "Export all non-zero accounts from current state to a file",
 	Flags: []cli.Flag{
 		utils.DataDirFlag,
 		utils.NetworkIdFlag,
+		&cli.StringFlag{
+			Name:    "out",
+			Aliases: []string{"o"},
+			Usage:   "Output file path",
+		},
+		&cli.BoolFlag{
+			Name:    "verbose",
+			Aliases: []string{"v"},
+			Usage:   "Enable verbose logging",
+		},
 	},
 	Action: dumpBalances,
 }
@@ -30,66 +41,134 @@ func init() {
 }
 
 func dumpBalances(ctx *cli.Context) error {
-	cfg := &node.Config{DataDir: ctx.String(utils.DataDirFlag.Name)}
+	// Connect to Ethereum node
+	stack, service, err := connectEthereum(
+		ctx.String(utils.DataDirFlag.Name),
+		ctx.Uint64(utils.NetworkIdFlag.Name),
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if cerr := stack.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close node: %v\n", cerr)
+		}
+	}()
+
+	// Get state database at latest header
+	stateDB, err := getStateDB(service)
+	if err != nil {
+		return err
+	}
+
+	// Fetch non-zero balances
+	entries, err := fetchBalances(stateDB, ctx.Bool("verbose"))
+	if err != nil {
+		return err
+	}
+
+	// Determine output path
+	outPath := ctx.String("out")
+	if outPath == "" {
+		outPath = filepath.Join(ctx.String(utils.DataDirFlag.Name), "addresses_balances.txt")
+	}
+
+	// Write results
+	if err := writeBalances(outPath, entries); err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ Dump completed: %s\n", outPath)
+	return nil
+}
+
+// connectEthereum initializes and starts an Ethereum node and service
+func connectEthereum(dataDir string, networkID uint64) (*node.Node, *eth.Ethereum, error) {
+	cfg := &node.Config{DataDir: dataDir}
 	stack, err := node.New(cfg)
 	if err != nil {
-		return fmt.Errorf("node.New failed: %w", err)
+		return nil, nil, fmt.Errorf("failed to create node: %w", err)
 	}
-	ethCfg := &eth.Config{NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name)}
+
+	ethCfg := &eth.Config{NetworkId: networkID}
 	service, err := eth.New(stack, ethCfg)
 	if err != nil {
-		return fmt.Errorf("eth.New failed: %w", err)
+		return nil, nil, fmt.Errorf("failed to create eth service: %w", err)
 	}
 	stack.RegisterLifecycle(service)
+
 	if err := stack.Start(); err != nil {
-		return fmt.Errorf("node.Start failed: %w", err)
+		return nil, nil, fmt.Errorf("failed to start node: %w", err)
 	}
-	defer stack.Close()
+	return stack, service, nil
+}
 
+// getStateDB retrieves the state database at the current head
+func getStateDB(service *eth.Ethereum) (*state.StateDB, error) {
 	header := service.BlockChain().CurrentHeader()
-	root := header.Root
-
-	stateDB, err := service.BlockChain().StateAt(root)
+	stateDB, err := service.BlockChain().StateAt(header.Root)
 	if err != nil {
-		return fmt.Errorf("StateAt failed: %w", err)
+		return nil, fmt.Errorf("failed to get state at root: %w", err)
 	}
+	return stateDB, nil
+}
 
-	dump := stateDB.RawDump(&state.DumpConfig{
-		SkipCode:    true,
-		SkipStorage: true,
-	})
+type accountEntry struct {
+	Address common.Address
+	Balance *big.Int
+}
 
-	type entry struct {
-		addr common.Address
-		bal  *big.Int
-	}
-	var list []entry
+// fetchBalances scans all accounts and returns those with non-zero balance
+func fetchBalances(stateDB *state.StateDB, verbose bool) ([]accountEntry, error) {
+	dump := stateDB.RawDump(&state.DumpConfig{SkipCode: true, SkipStorage: true})
+
+	var entries []accountEntry
+	processedCount := 0
+	// Здесь убрали addrStr, чтобы не было “declared and not used”
 	for _, acc := range dump.Accounts {
+		processedCount++
 		if acc.Address == nil {
 			continue
 		}
-		bi := new(big.Int)
-		bi.SetString(acc.Balance, 10)
-		if bi.Sign() > 0 {
-			list = append(list, entry{*acc.Address, bi})
+		balInt, ok := new(big.Int).SetString(acc.Balance, 10)
+		if !ok {
+			return nil, fmt.Errorf("invalid balance for account %s: %s", acc.Address.Hex(), acc.Balance)
+		}
+		if balInt.Sign() > 0 {
+			entries = append(entries, accountEntry{*acc.Address, balInt})
+		}
+		if verbose && processedCount%100000 == 0 {
+			fmt.Printf("Processed %d accounts, %d non-zero so far\n", processedCount, len(entries))
 		}
 	}
 
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].bal.Cmp(list[j].bal) > 0
+	// Sort descending by balance
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Balance.Cmp(entries[j].Balance) > 0
 	})
+	return entries, nil
+}
 
-	f, err := os.Create("addresses_balances.txt")
+// writeBalances writes the sorted balances to the specified file
+func writeBalances(path string, entries []accountEntry) error {
+	f, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("cannot create file: %w", err)
+		return fmt.Errorf("failed to create output file: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "warning: failed to close file: %v\n", cerr)
+		}
+	}()
 
-	for _, e := range list {
-		ethVal := new(big.Float).Quo(new(big.Float).SetInt(e.bal), big.NewFloat(1e18))
-		fmt.Fprintf(f, "%s\t%.6f\n", e.addr.Hex(), ethVal)
+	// Prepare divisor for Wei to Ether conversion
+	denom := new(big.Float).SetInt(big.NewInt(1_000_000_000_000_000_000))
+	buf := new(big.Float)
+	for _, e := range entries {
+		buf.Quo(new(big.Float).SetInt(e.Balance), denom)
+		if _, err := fmt.Fprintf(f, "%s\t%.6f\n", e.Address.Hex(), buf); err != nil {
+			return fmt.Errorf("failed to write to file: %w", err)
+		}
 	}
-
-	fmt.Println("✅ Dump completed: addresses_balances.txt")
 	return nil
 }
