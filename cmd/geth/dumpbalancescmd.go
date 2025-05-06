@@ -26,8 +26,8 @@ var dumpBalancesCommand = &cli.Command{
 }
 
 func init() {
-	Commands = append(Commands, dumpBalancesCommand)
-	sort.Sort(cli.CommandsByName(Commands))
+	commands = append(commands, dumpBalancesCommand)
+	sort.Sort(cli.CommandsByName(commands))
 }
 
 func dumpBalances(ctx *cli.Context) error {
@@ -36,9 +36,7 @@ func dumpBalances(ctx *cli.Context) error {
 	if err != nil {
 		return fmt.Errorf("node.New failed: %w", err)
 	}
-	ethCfg := &eth.Config{
-		NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name),
-	}
+	ethCfg := &eth.Config{NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name)}
 	service, err := eth.New(stack, ethCfg)
 	if err != nil {
 		return fmt.Errorf("eth.New failed: %w", err)
@@ -49,11 +47,10 @@ func dumpBalances(ctx *cli.Context) error {
 	}
 	defer stack.Close()
 
-	chain := service.BlockChain()
-	head := chain.CurrentBlock()
-	root := head.StateRoot()
+	header := service.BlockChain().Header()
+	root := header.Root
 
-	stateDB, err := chain.StateAt(root)
+	stateDB, err := service.BlockChain().StateAt(root)
 	if err != nil {
 		return fmt.Errorf("StateAt failed: %w", err)
 	}
@@ -88,7 +85,6 @@ func dumpBalances(ctx *cli.Context) error {
 		return fmt.Errorf("cannot create file: %w", err)
 	}
 	defer f.Close()
-
 	for _, e := range list {
 		ethVal := new(big.Float).Quo(new(big.Float).SetInt(e.bal), big.NewFloat(1e18))
 		fmt.Fprintf(f, "%s\t%.6f\n", e.addr.Hex(), ethVal)
