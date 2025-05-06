@@ -8,7 +8,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 
-	"github.com/ethereum/go-ethereum/cmd/geth/utils"
+	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/eth"
@@ -17,7 +17,7 @@ import (
 
 var dumpBalancesCommand = &cli.Command{
 	Name:  "dump-balances",
-	Usage: "Dump all accounts with non-zero balance from current state to file",
+	Usage: "Export all non-zero accounts from current state to addresses_balances.txt",
 	Flags: []cli.Flag{
 		utils.DataDirFlag,
 		utils.NetworkIdFlag,
@@ -34,28 +34,28 @@ func dumpBalances(ctx *cli.Context) error {
 	cfg := &node.Config{DataDir: ctx.String(utils.DataDirFlag.Name)}
 	stack, err := node.New(cfg)
 	if err != nil {
-		return err
+		return fmt.Errorf("node.New failed: %w", err)
 	}
 	ethCfg := &eth.Config{
 		NetworkId: ctx.Uint64(utils.NetworkIdFlag.Name),
 	}
-	ethService, err := eth.New(stack, ethCfg)
+	service, err := eth.New(stack, ethCfg)
 	if err != nil {
-		return err
+		return fmt.Errorf("eth.New failed: %w", err)
 	}
-	stack.RegisterLifecycle(ethService)
+	stack.RegisterLifecycle(service)
 	if err := stack.Start(); err != nil {
-		return err
+		return fmt.Errorf("node.Start failed: %w", err)
 	}
 	defer stack.Close()
 
-	chain := ethService.BlockChain()
+	chain := service.BlockChain()
 	head := chain.CurrentBlock()
 	root := head.StateRoot()
 
 	stateDB, err := chain.StateAt(root)
 	if err != nil {
-		return err
+		return fmt.Errorf("StateAt failed: %w", err)
 	}
 
 	dump := stateDB.RawDump(&state.DumpConfig{
@@ -63,19 +63,19 @@ func dumpBalances(ctx *cli.Context) error {
 		SkipStorage: true,
 	})
 
-	type acct struct {
+	type entry struct {
 		addr common.Address
 		bal  *big.Int
 	}
-	var list []acct
-	for _, a := range dump.Accounts {
-		if a.Address == nil {
+	var list []entry
+	for _, acc := range dump.Accounts {
+		if acc.Address == nil {
 			continue
 		}
-		b := new(big.Int)
-		b.SetString(a.Balance, 10)
-		if b.Sign() > 0 {
-			list = append(list, acct{*a.Address, b})
+		bi := new(big.Int)
+		bi.SetString(acc.Balance, 10)
+		if bi.Sign() > 0 {
+			list = append(list, entry{*acc.Address, bi})
 		}
 	}
 
@@ -85,13 +85,15 @@ func dumpBalances(ctx *cli.Context) error {
 
 	f, err := os.Create("addresses_balances.txt")
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot create file: %w", err)
 	}
 	defer f.Close()
-	for _, x := range list {
-		ethVal := new(big.Float).Quo(new(big.Float).SetInt(x.bal), big.NewFloat(1e18))
-		fmt.Fprintf(f, "%s\t%.6f\n", x.addr.Hex(), ethVal)
+
+	for _, e := range list {
+		ethVal := new(big.Float).Quo(new(big.Float).SetInt(e.bal), big.NewFloat(1e18))
+		fmt.Fprintf(f, "%s\t%.6f\n", e.addr.Hex(), ethVal)
 	}
+
 	fmt.Println("✅ Dump completed: addresses_balances.txt")
 	return nil
 }
