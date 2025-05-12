@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"math/big"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/node"
+	"github.com/schollz/progressbar/v3"
 	"github.com/urfave/cli/v2"
 )
 
@@ -119,24 +121,38 @@ type accountEntry struct {
 
 // fetchBalances scans all accounts and returns those with non-zero balance
 func fetchBalances(stateDB *state.StateDB, verbose bool) ([]accountEntry, error) {
+	// Dump all accounts into a map[string]DumpAccount
 	dump := stateDB.RawDump(&state.DumpConfig{SkipCode: true, SkipStorage: true})
 
-	var entries []accountEntry
-	processedCount := 0
-	for _, acc := range dump.Accounts {
-		processedCount++
-		if acc.Address == nil {
-			continue
+	// Prepare a determinate progress bar if verbose
+	total := len(dump.Accounts)
+	var bar *progressbar.ProgressBar
+	if verbose {
+		bar = progressbar.NewOptions(total,
+			progressbar.OptionEnableColorCodes(false),
+			progressbar.OptionShowCount(),
+			progressbar.OptionShowDescriptionAtLineEnd(),
+			progressbar.OptionSetDescription("Scanning accounts"),
+			progressbar.OptionSetWidth(20),
+		)
+		defer bar.Close()
+	}
+
+	// Iterate over the map: key is stringified address
+	entries := make([]accountEntry, 0, total)
+	for addrStr, acc := range dump.Accounts {
+		if verbose {
+			bar.Add(1)
 		}
-		balInt, ok := new(big.Int).SetString(acc.Balance, 10)
+		// Parse balance from string to big.Int
+		bal, ok := new(big.Int).SetString(acc.Balance, 10)
 		if !ok {
-			return nil, fmt.Errorf("invalid balance for account %s: %s", acc.Address.Hex(), acc.Balance)
+			return nil, fmt.Errorf("invalid balance for %s: %s", addrStr, acc.Balance)
 		}
-		if balInt.Sign() > 0 {
-			entries = append(entries, accountEntry{*acc.Address, balInt})
-		}
-		if verbose && processedCount%100000 == 0 {
-			fmt.Printf("Processed %d accounts, %d non-zero so far\n", processedCount, len(entries))
+		if bal.Sign() > 0 {
+			// Convert hex-string back to common.Address
+			address := common.HexToAddress(addrStr)
+			entries = append(entries, accountEntry{address, bal})
 		}
 	}
 
@@ -160,12 +176,11 @@ func writeBalances(path string, entries []accountEntry) error {
 	}()
 
 	// Prepare divisor for Wei to Ether conversion
-	denom := new(big.Float).SetInt(big.NewInt(1_000_000_000_000_000_000))
-	buf := new(big.Float)
+	bw := bufio.NewWriter(f)
+	defer bw.Flush()
 	for _, e := range entries {
-		buf.Quo(new(big.Float).SetInt(e.Balance), denom)
-		if _, err := fmt.Fprintf(f, "%s\t%.6f\n", e.Address.Hex(), buf); err != nil {
-			return fmt.Errorf("failed to write to file: %w", err)
+		if _, err := bw.WriteString(e.Address.Hex() + "\t" + e.Balance.String() + "\n"); err != nil {
+			return fmt.Errorf("failed to write to buffer: %w", err)
 		}
 	}
 	return nil
