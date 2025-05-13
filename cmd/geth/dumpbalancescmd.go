@@ -14,33 +14,21 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/eth"
 	"github.com/ethereum/go-ethereum/node"
-	"github.com/schollz/progressbar/v3"
 	"github.com/urfave/cli/v2"
 )
 
+// dumpBalancesCommand integrates into Geth to sync and dump balances periodically.
 var dumpBalancesCommand = &cli.Command{
 	Name:  "dump-balances",
-	Usage: "Continuously monitor new blocks and export non-zero accounts at intervals",
+	Usage: "Wait for full sync, then periodically dump non-zero account balances",
 	Flags: []cli.Flag{
 		utils.DataDirFlag,
 		utils.NetworkIdFlag,
-		&cli.StringFlag{
-			Name:    "out",
-			Aliases: []string{"o"},
-			Usage:   "Output file prefix",
-		},
-		&cli.DurationFlag{
-			Name:  "interval",
-			Usage: "Time interval between dumps (e.g. 1h, 30m)",
-			Value: time.Hour,
-		},
-		&cli.BoolFlag{
-			Name:    "verbose",
-			Aliases: []string{"v"},
-			Usage:   "Enable verbose logging",
-		},
+		&cli.StringFlag{Name: "out", Aliases: []string{"o"}, Usage: "Output file prefix"},
+		&cli.DurationFlag{Name: "interval", Usage: "Interval between dumps (e.g. 1h)", Value: time.Hour},
+		&cli.BoolFlag{Name: "verbose", Aliases: []string{"v"}, Usage: "Enable verbose logging"},
 	},
-	Action: dumpBalancesContinuous,
+	Action: runDumpBalances,
 }
 
 func init() {
@@ -48,7 +36,8 @@ func init() {
 	sort.Sort(cli.CommandsByName(app.Commands))
 }
 
-func dumpBalancesContinuous(ctx *cli.Context) error {
+// runDumpBalances starts the node, waits for sync, then dumps balances.
+func runDumpBalances(ctx *cli.Context) error {
 	stack, service, err := connectEthereum(
 		ctx.String(utils.DataDirFlag.Name),
 		ctx.Uint64(utils.NetworkIdFlag.Name),
@@ -58,53 +47,68 @@ func dumpBalancesContinuous(ctx *cli.Context) error {
 	}
 	defer stack.Close()
 
-	outPrefix := ctx.String("out")
+	out := ctx.String("out")
 	interval := ctx.Duration("interval")
 	verbose := ctx.Bool("verbose")
 
+	if verbose {
+		fmt.Printf("DataDir: %s, NetworkID: %d, Out: %s, Interval: %s\n",
+			ctx.String(utils.DataDirFlag.Name), ctx.Uint64(utils.NetworkIdFlag.Name), out, interval)
+	}
+
+	// Wait until fully synchronized
 	waitForSync(service)
+	if verbose {
+		fmt.Println("✅ Node fully synced. Starting periodic dumps...")
+	}
 
-	fmt.Println("✅ Sync complete. Monitoring new blocks...")
-
+	// Subscribe to new head events
 	headCh := make(chan core.ChainHeadEvent)
 	sub := service.BlockChain().SubscribeChainHeadEvent(headCh)
 	defer sub.Unsubscribe()
 
+	// Ticker for interval
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	var latestRoot common.Hash
 	for ev := range headCh {
-		latestRoot = ev.Header.Root
 		select {
 		case <-ticker.C:
-			stateDB, err := service.BlockChain().StateAt(latestRoot)
+			root := ev.Header.Root
+			if verbose {
+				fmt.Printf("⏎ Dump root: %s\n", root.Hex())
+			}
+
+			stateDB, err := service.BlockChain().StateAt(root)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ failed to get state: %v\n", err)
+				fmt.Fprintf(os.Stderr, "❌ StateAt error: %v\n", err)
 				continue
 			}
-			entries, err := fetchBalances(stateDB, verbose)
+
+			entries, err := fetchBalances(stateDB)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "❌ fetchBalances error: %v\n", err)
 				continue
 			}
-			filename := makeTimestampFilename(outPrefix)
-			if err := writeBalances(filename, entries); err != nil {
+
+			file := makeTimestampFilename(out)
+			if err := writeBalances(file, entries); err != nil {
 				fmt.Fprintf(os.Stderr, "❌ writeBalances error: %v\n", err)
-			} else {
-				fmt.Printf("✅ Dump saved to %s\n", filename)
+			} else if verbose {
+				fmt.Printf("✅ Dump saved: %s\n", file)
 			}
 		default:
-			continue
 		}
 	}
 	return nil
 }
 
+// waitForSync blocks until the downloader has caught up (current >= highest).
 func waitForSync(service *eth.Ethereum) {
 	for {
-		progress := service.Downloader().Progress()
-		if progress.CurrentBlock == progress.HighestBlock {
+		prog := service.Downloader().Progress()
+		// Exit when current block index reaches or exceeds highest
+		if prog.CurrentBlock >= prog.HighestBlock {
 			return
 		}
 		fmt.Println("⏳ Waiting for sync...")
@@ -112,94 +116,64 @@ func waitForSync(service *eth.Ethereum) {
 	}
 }
 
-func makeTimestampFilename(prefix string) string {
-	timestamp := time.Now().Format("20060102_150405")
-	return fmt.Sprintf("%s_%s.txt", prefix, timestamp)
-}
-
-// connectEthereum initializes and starts an Ethereum node and service
+// connectEthereum initializes and starts a Geth node and Eth service.
 func connectEthereum(dataDir string, networkID uint64) (*node.Node, *eth.Ethereum, error) {
 	cfg := &node.Config{DataDir: dataDir}
 	stack, err := node.New(cfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create node: %w", err)
+		return nil, nil, fmt.Errorf("node.New: %w", err)
 	}
-
 	ethCfg := &eth.Config{NetworkId: networkID}
 	service, err := eth.New(stack, ethCfg)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create eth service: %w", err)
+		return nil, nil, fmt.Errorf("eth.New: %w", err)
 	}
-
 	if err := stack.Start(); err != nil {
-		return nil, nil, fmt.Errorf("failed to start node: %w", err)
+		return nil, nil, fmt.Errorf("stack.Start: %w", err)
 	}
 	return stack, service, nil
 }
 
-func getStateDB(service *eth.Ethereum) (*state.StateDB, error) {
-	header := service.BlockChain().CurrentHeader()
-	stateDB, err := service.BlockChain().StateAt(header.Root)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get state at root: %w", err)
-	}
-	return stateDB, nil
-}
-
+// accountEntry stores an address and its balance.
 type accountEntry struct {
 	Address common.Address
 	Balance *big.Int
 }
 
-func fetchBalances(stateDB *state.StateDB, verbose bool) ([]accountEntry, error) {
+// fetchBalances returns sorted non-zero balances from stateDB.
+func fetchBalances(stateDB *state.StateDB) ([]accountEntry, error) {
 	dump := stateDB.RawDump(&state.DumpConfig{SkipCode: true, SkipStorage: true})
-	total := len(dump.Accounts)
-	var bar *progressbar.ProgressBar
-	if verbose {
-		bar = progressbar.NewOptions(total,
-			progressbar.OptionEnableColorCodes(false),
-			progressbar.OptionShowCount(),
-			progressbar.OptionShowDescriptionAtLineEnd(),
-			progressbar.OptionSetDescription("Scanning accounts"),
-			progressbar.OptionSetWidth(20),
-		)
-		defer bar.Close()
-	}
-
-	entries := make([]accountEntry, 0, total)
+	res := make([]accountEntry, 0, len(dump.Accounts))
 	for addrStr, acc := range dump.Accounts {
-		if verbose {
-			bar.Add(1)
-		}
-		bal, ok := new(big.Int).SetString(acc.Balance, 10)
-		if !ok {
-			return nil, fmt.Errorf("invalid balance for %s: %s", addrStr, acc.Balance)
-		}
+		bal, _ := new(big.Int).SetString(acc.Balance, 10)
 		if bal.Sign() > 0 {
-			address := common.HexToAddress(addrStr)
-			entries = append(entries, accountEntry{address, bal})
+			res = append(res, accountEntry{common.HexToAddress(addrStr), bal})
 		}
 	}
-
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].Balance.Cmp(entries[j].Balance) > 0
+	sort.Slice(res, func(i, j int) bool {
+		return res[i].Balance.Cmp(res[j].Balance) > 0
 	})
-	return entries, nil
+	return res, nil
 }
 
+// makeTimestampFilename builds filename prefix_timestamp.txt.
+func makeTimestampFilename(prefix string) string {
+	return fmt.Sprintf("%s_%s.txt", prefix, time.Now().Format("20060102_150405"))
+}
+
+// writeBalances writes address<TAB>ETH-balance per line.
 func writeBalances(path string, entries []accountEntry) error {
 	f, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("failed to create output file: %w", err)
+		return err
 	}
 	defer f.Close()
-
-	bw := bufio.NewWriter(f)
-	defer bw.Flush()
+	w := bufio.NewWriter(f)
+	defer w.Flush()
 	for _, e := range entries {
-		eth := new(big.Float).Quo(new(big.Float).SetInt(e.Balance), big.NewFloat(1e18))
-		if _, err := bw.WriteString(e.Address.Hex() + "\t" + eth.Text('f', 6) + "\n"); err != nil {
-			return fmt.Errorf("failed to write to buffer: %w", err)
+		val := new(big.Float).Quo(new(big.Float).SetInt(e.Balance), big.NewFloat(1e18))
+		if _, err := w.WriteString(fmt.Sprintf("%s\t%s\n", e.Address.Hex(), val.Text('f', 6))); err != nil {
+			return err
 		}
 	}
 	return nil

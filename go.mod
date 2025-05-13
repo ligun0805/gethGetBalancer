@@ -57,7 +57,6 @@ require (
 	github.com/protolambda/zrnt v0.34.1
 	github.com/protolambda/ztyp v0.2.2
 	github.com/rs/cors v1.7.0
-	github.com/schollz/progressbar/v3 v3.18.0
 	github.com/shirou/gopsutil v3.21.4-0.20210419000835-c7a38de76ee5+incompatible
 	github.com/status-im/keycard-go v0.2.0
 	github.com/stretchr/testify v1.10.0
@@ -76,11 +75,6 @@ require (
 	google.golang.org/protobuf v1.34.2
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v3 v3.0.1
-)
-
-require (
-	github.com/mitchellh/colorstring v0.0.0-20190213212951-d06e56a500db // indirect
-	golang.org/x/term v0.29.0 // indirect
 )
 
 require (
