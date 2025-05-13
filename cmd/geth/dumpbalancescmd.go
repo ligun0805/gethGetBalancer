@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/big"
 	"os"
-	"path/filepath"
 	"sort"
 	"time"
 
@@ -76,7 +75,7 @@ func dumpBalancesContinuous(ctx *cli.Context) error {
 
 	var latestRoot common.Hash
 	for ev := range headCh {
-		latestRoot = ev.Block.Root()
+		latestRoot = ev.Header.Root
 		select {
 		case <-ticker.C:
 			stateDB, err := service.BlockChain().StateAt(latestRoot)
@@ -104,7 +103,8 @@ func dumpBalancesContinuous(ctx *cli.Context) error {
 
 func waitForSync(service *eth.Ethereum) {
 	for {
-		if service.SyncProgress() == nil {
+		progress := service.Downloader().Progress()
+		if progress.CurrentBlock == progress.HighestBlock {
 			return
 		}
 		fmt.Println("⏳ Waiting for sync...")
