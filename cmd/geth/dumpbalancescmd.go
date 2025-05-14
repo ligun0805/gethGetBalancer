@@ -87,6 +87,10 @@ func runDumpBalances(ctx *cli.Context) error {
 	utils.SetDataDir(ctx, &nodeCfg)
 	utils.SetNodeConfig(ctx, &nodeCfg)
 
+	fmt.Printf("HTTP: %v:%d, API: %v\n", nodeCfg.HTTPHost, nodeCfg.HTTPPort, nodeCfg.HTTPModules)
+	fmt.Printf("WS: %v:%d, API: %v\n", nodeCfg.WSHost, nodeCfg.WSPort, nodeCfg.WSModules)
+	fmt.Printf("AuthRPC: %v:%d, JWT: %v\n", nodeCfg.AuthAddr, nodeCfg.AuthPort, nodeCfg.JWTSecret)
+
 	// Create and start node
 	stack, err := node.New(&nodeCfg)
 	if err != nil {
