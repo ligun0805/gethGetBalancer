@@ -119,6 +119,8 @@ func runDumpBalances(ctx *cli.Context) error {
 	fmt.Println("✅ Initial sync complete, starting full dump")
 
 	// Perform full state dump
+	fmt.Println("Waiting extra 15s to ensure trie state loaded...")
+	time.Sleep(15 * time.Second)
 	dumpAllByPrefix(ethService, outDir)
 
 	// Subscribe to chain head events for incremental updates
@@ -166,6 +168,7 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 	files := make([]*os.File, 256)
 
 	head := service.BlockChain().CurrentHeader()
+	fmt.Fprintf(os.Stderr, ">>> Current HEAD ROOT: %s\n", head.Root.Hex())
 	stateDB, err := service.BlockChain().StateAt(head.Root)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "StateAt error: %v\n", err)
@@ -180,7 +183,11 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 	}
 	nodeIt, err := tr.NodeIterator(nil)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "trie iterator init: %v\n", err)
+		fmt.Fprintf(os.Stderr, "FATAL: NodeIterator error: %v\n", err)
+		return
+	}
+	if nodeIt == nil {
+		fmt.Fprintf(os.Stderr, "FATAL: NodeIterator is nil\n")
 		return
 	}
 	iter := trie.NewIterator(nodeIt)
@@ -193,6 +200,7 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 		if bal.Sign() == 0 {
 			continue
 		}
+		fmt.Fprintf(os.Stderr, "ADDR: %s BAL: %s\n", addr.Hex(), bal.String())
 		balStr := formatBalance(bal)
 		p := int(key[0])
 
