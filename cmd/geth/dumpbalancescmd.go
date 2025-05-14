@@ -36,8 +36,9 @@ func init() {
 	sort.Sort(cli.CommandsByName(app.Commands))
 }
 
-// runDumpBalances starts the node, waits for sync, then dumps balances.
+// runDumpBalances starts the node, waits for sync, then dumps balances periodically.
 func runDumpBalances(ctx *cli.Context) error {
+	// 1) connect and start node
 	stack, service, err := connectEthereum(
 		ctx.String(utils.DataDirFlag.Name),
 		ctx.Uint64(utils.NetworkIdFlag.Name),
@@ -52,62 +53,76 @@ func runDumpBalances(ctx *cli.Context) error {
 	verbose := ctx.Bool("verbose")
 
 	if verbose {
-		fmt.Printf("DataDir: %s, NetworkID: %d, Out: %s, Interval: %s\n",
+		fmt.Printf("DataDir=%s NetworkID=%d Out=%s Interval=%s\n",
 			ctx.String(utils.DataDirFlag.Name), ctx.Uint64(utils.NetworkIdFlag.Name), out, interval)
 	}
 
-	// Wait until fully synchronized
+	// 2) wait initial sync
 	waitForSync(service)
-	if verbose {
-		fmt.Println("✅ Node fully synced. Starting periodic dumps...")
+	fmt.Println("✅ Node fully synced. Starting dumps…")
+
+	// 3) initial dump immediately after sync
+	latestRoot := service.BlockChain().CurrentHeader().Root
+	fmt.Printf("⏎ [Dump] Initial dump at root: %s\n", latestRoot.Hex())
+	if err := doDump(service, latestRoot, out); err != nil {
+		fmt.Fprintf(os.Stderr, "❌ initial dump error: %v\n", err)
 	}
 
-	// Subscribe to new head events
+	// 4) subscribe to new head events
 	headCh := make(chan core.ChainHeadEvent)
 	sub := service.BlockChain().SubscribeChainHeadEvent(headCh)
 	defer sub.Unsubscribe()
 
-	// Ticker for interval
+	// 5) ticker for periodic dumps
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	for ev := range headCh {
+	// 6) event loop: update root on headCh, dump on ticker
+	for {
 		select {
-		case <-ticker.C:
-			root := ev.Header.Root
+		case ev := <-headCh:
+			latestRoot = ev.Header.Root
 			if verbose {
-				fmt.Printf("⏎ Dump root: %s\n", root.Hex())
+				fmt.Printf("🆕 New head event: root=%s\n", latestRoot.Hex())
 			}
 
-			stateDB, err := service.BlockChain().StateAt(root)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ StateAt error: %v\n", err)
-				continue
+		case <-ticker.C:
+			fmt.Printf("⏎ [Dump] Ticker dump at root: %s\n", latestRoot.Hex())
+			if err := doDump(service, latestRoot, out); err != nil {
+				fmt.Fprintf(os.Stderr, "❌ ticker dump error: %v\n", err)
 			}
-
-			entries, err := fetchBalances(stateDB)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "❌ fetchBalances error: %v\n", err)
-				continue
-			}
-
-			file := makeTimestampFilename(out)
-			if err := writeBalances(file, entries); err != nil {
-				fmt.Fprintf(os.Stderr, "❌ writeBalances error: %v\n", err)
-			} else if verbose {
-				fmt.Printf("✅ Dump saved: %s\n", file)
-			}
-		default:
 		}
 	}
+}
+
+// doDump performs the fetchBalances and writeBalances for a given root.
+func doDump(service *eth.Ethereum, root common.Hash, out string) error {
+	// get state at root
+	stateDB, err := service.BlockChain().StateAt(root)
+	if err != nil {
+		return fmt.Errorf("StateAt: %w", err)
+	}
+	// fetch balances
+	fmt.Println("... fetching balances ...")
+	entries, err := fetchBalances(stateDB)
+	if err != nil {
+		return fmt.Errorf("fetchBalances: %w", err)
+	}
+	fmt.Printf("✅ fetched %d non-zero balances\n", len(entries))
+	// write to file
+	filename := makeTimestampFilename(out)
+	fmt.Printf("... writing %d entries to %s ...\n", len(entries), filename)
+	if err := writeBalances(filename, entries); err != nil {
+		return fmt.Errorf("writeBalances: %w", err)
+	}
+	fmt.Printf("✅ Dump saved: %s\n", filename)
 	return nil
 }
 
-// waitForSync blocks until the downloader has caught up (current >= highest).
+// waitForSync blocks until initial chain sync completes.
 func waitForSync(service *eth.Ethereum) {
 	for {
 		prog := service.Downloader().Progress()
-		// Exit when current block index reaches or exceeds highest
 		if prog.CurrentBlock >= prog.HighestBlock {
 			return
 		}
@@ -116,15 +131,15 @@ func waitForSync(service *eth.Ethereum) {
 	}
 }
 
-// connectEthereum initializes and starts a Geth node and Eth service.
+// connectEthereum starts a Geth node and Eth service.
 func connectEthereum(dataDir string, networkID uint64) (*node.Node, *eth.Ethereum, error) {
 	cfg := &node.Config{DataDir: dataDir}
 	stack, err := node.New(cfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("node.New: %w", err)
 	}
-	ethCfg := &eth.Config{NetworkId: networkID}
-	service, err := eth.New(stack, ethCfg)
+	ecfg := &eth.Config{NetworkId: networkID}
+	service, err := eth.New(stack, ecfg)
 	if err != nil {
 		return nil, nil, fmt.Errorf("eth.New: %w", err)
 	}
@@ -134,13 +149,13 @@ func connectEthereum(dataDir string, networkID uint64) (*node.Node, *eth.Ethereu
 	return stack, service, nil
 }
 
-// accountEntry stores an address and its balance.
+// accountEntry holds an address and its balance.
 type accountEntry struct {
 	Address common.Address
 	Balance *big.Int
 }
 
-// fetchBalances returns sorted non-zero balances from stateDB.
+// fetchBalances scans all accounts and returns non-zero balances sorted.
 func fetchBalances(stateDB *state.StateDB) ([]accountEntry, error) {
 	dump := stateDB.RawDump(&state.DumpConfig{SkipCode: true, SkipStorage: true})
 	res := make([]accountEntry, 0, len(dump.Accounts))
@@ -156,12 +171,12 @@ func fetchBalances(stateDB *state.StateDB) ([]accountEntry, error) {
 	return res, nil
 }
 
-// makeTimestampFilename builds filename prefix_timestamp.txt.
+// makeTimestampFilename builds a filename with prefix and timestamp.
 func makeTimestampFilename(prefix string) string {
 	return fmt.Sprintf("%s_%s.txt", prefix, time.Now().Format("20060102_150405"))
 }
 
-// writeBalances writes address<TAB>ETH-balance per line.
+// writeBalances writes each account and ETH balance to the given file.
 func writeBalances(path string, entries []accountEntry) error {
 	f, err := os.Create(path)
 	if err != nil {
