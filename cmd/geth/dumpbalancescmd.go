@@ -233,6 +233,7 @@ func loadProgress(outDir string) (*DumpProgress, error) {
 // dumpAllByPrefix performs a full dump of all non-zero balances by address prefix
 func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
     start := time.Now()
+    log.Printf("▶ Start full dump...")
 
     // Determine number of workers (75% of CPU)
     numCPU := runtime.NumCPU()
@@ -266,63 +267,58 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
         log.Printf("Dumping state at block %d", head.Number.Uint64())
     }
 
-    // Channel to send accounts to workers
+    // Define account type and per-worker channels
     type account struct {
         prefix int
         addr   common.Address
         bal    *big.Int
     }
-    accountCh := make(chan account, 1024)
-
-    // Assign prefixes to workers evenly
-    prefixes := make([][]int, numWorkers)
-    for i := 0; i < 256; i++ {
-        if done[i] {
-            continue
-        }
-        prefixes[i%numWorkers] = append(prefixes[i%numWorkers], i)
+    chs := make([]chan account, numWorkers)
+    for i := 0; i < numWorkers; i++ {
+        chs[i] = make(chan account, 1024)
     }
 
     var wg sync.WaitGroup
-    // Worker function
-    for w := 0; w < numWorkers; w++ {
-        if len(prefixes[w]) == 0 {
-            continue
-        }
+    // Launch workers
+    for i := 0; i < numWorkers; i++ {
         wg.Add(1)
-        go func(workerPrefixes []int) {
+        go func(ch <-chan account) {
             defer wg.Done()
             writers := make(map[int]*bufio.Writer)
             files := make(map[int]*os.File)
-            for acc := range accountCh {
+            prefixCount := make(map[int]int)
+            prefixStart := make(map[int]time.Time)
+
+            for acc := range ch {
                 p := acc.prefix
-                // only handle prefixes assigned to this worker
-                found := false
-                for _, wp := range workerPrefixes {
-                    if wp == p {
-                        found = true
-                        break
-                    }
-                }
-                if !found {
-                    continue
-                }
+                // Initialize writer for this prefix
                 if _, ok := writers[p]; !ok {
-                    tmpPath := filepath.Join(outDir, fmt.Sprintf("%02x.tmp", p))
-                    f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+                    tmp := filepath.Join(outDir, fmt.Sprintf("%02x.tmp", p))
+                    f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
                     if err != nil {
                         if verboseLog {
-                            log.Printf("Error creating tmp file %s: %v", tmpPath, err)
+                            log.Printf("Error creating tmp file %s: %v", tmp, err)
                         }
                         continue
                     }
                     writers[p] = bufio.NewWriter(f)
                     files[p] = f
+                    if !verboseLog {
+                        log.Printf("Started dumping prefix %02x", p)
+                    }
+                    prefixStart[p] = time.Now()
+                    prefixCount[p] = 0
                 }
-                balanceStr := formatBalance(acc.bal)
-                writers[p].WriteString(acc.addr.Hex() + "\t" + balanceStr + "\n")
+                // Write address and balance
+                balStr := formatBalance(acc.bal)
+                writers[p].WriteString(acc.addr.Hex() + "\t" + balStr + "\n")
+                prefixCount[p]++
+                if verboseLog {
+                    log.Printf("ADDR: %s BAL: %s", acc.addr.Hex(), balStr)
+                }
             }
-            // Flush and sort each prefix file for this worker
+
+            // Flush, sort and finalize each prefix
             for p, w := range writers {
                 w.Flush()
                 files[p].Close()
@@ -335,17 +331,21 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
                     log.Printf("rename %s -> %s: %v", tmp, final, err)
                 }
                 accountsProcessed.Inc()
-                if verboseLog {
+                if !verboseLog {
+                    log.Printf("Finished dumping prefix %02x", p)
+                    elapsed := time.Since(prefixStart[p]).Seconds()
+                    log.Printf("Saved %d addresses in %.0f s", prefixCount[p], elapsed)
+                } else {
                     log.Printf("Finished prefix %02x", p)
                 }
-                // Update progress
+                // Save progress
                 progress.PrefixesDone = append(progress.PrefixesDone, p)
                 saveProgress(outDir, progress)
             }
-        }(prefixes[w])
+        }(chs[i])
     }
 
-    // Iterate state trie and send to workers
+    // Iterate state trie and dispatch to workers
     stateDB, err := service.BlockChain().StateAt(head.Root)
     if err != nil {
         log.Printf("StateAt error: %v", err)
@@ -369,47 +369,37 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
     if verboseLog {
         log.Printf("Starting iteration...")
     }
-    var count, nonZero int
+
+    var nonZero int
     for iter.Next() {
-        count++
         key := iter.Key
-        addr := common.BytesToAddress(key)
-        bal := stateDB.GetBalance(addr)
-        if bal == nil {
-            if verboseLog {
-                log.Printf("Balance is nil for addr %s", addr.Hex())
-            }
-            continue
-        }
-        balBig := bal.ToBig()
-        if balBig == nil {
-            if verboseLog {
-                log.Printf("ToBig is nil for addr %s", addr.Hex())
-            }
-            continue
-        }
-        if balBig.Sign() == 0 {
-            continue
-        }
         p := int(key[0])
-        // skip if this prefix was already done
         if done[p] {
             continue
         }
-        nonZero++
-        accountCh <- account{prefix: p, addr: addr, bal: balBig}
-        if verboseLog {
-            log.Printf("Account: %s Balance: %s", addr.Hex(), balBig.String())
+        bal256 := stateDB.GetBalance(common.BytesToAddress(key))
+        if bal256 == nil {
+            continue
         }
-    }
-    close(accountCh)
-    wg.Wait()
-    if verboseLog {
-        log.Printf("Iteration complete. Total entries: %d, non-zero balances: %d", count, nonZero)
+        bal := bal256.ToBig()
+        if bal == nil || bal.Sign() == 0 {
+            continue
+        }
+        idx := p % numWorkers
+        chs[idx] <- account{prefix: p, addr: common.BytesToAddress(key), bal: bal}
+        nonZero++
     }
 
+    // Close all channels and wait for workers to finish
+    for i := 0; i < numWorkers; i++ {
+        close(chs[i])
+    }
+    wg.Wait()
+
     fullDumpDuration.Observe(time.Since(start).Seconds())
+    log.Printf("✅ Full dump finished in %.0f s, saved %d addresses", time.Since(start).Seconds(), nonZero)
 }
+
 
 // removeAddresses removes lines with given addresses from the file at mainPath
 func removeAddresses(mainPath string, addresses []common.Address) error {
