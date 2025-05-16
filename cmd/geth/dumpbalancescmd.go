@@ -349,7 +349,8 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 			lastLog = time.Now()
 		}
 		key := it.Key
-		p := int(key[0])
+		addr := common.BytesToAddress(key)
+		p := int(addr.Bytes()[0])
 		if done[p] {
 			continue
 		}
