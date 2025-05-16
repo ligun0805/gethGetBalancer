@@ -132,21 +132,20 @@ func runDumpBalances(ctx *cli.Context) error {
 
 	// After full dump, check sync state
 	head := ethService.BlockChain().CurrentHeader()
-	highest := ethService.BlockChain().CurrentHeader()
-	if highest != nil && head != nil {
-		if highest.Number.Uint64() > head.Number.Uint64() {
-			diff := highest.Number.Uint64() - head.Number.Uint64()
-			if diff < 50 {
-				if verboseLog {
-					log.Printf("Current block difference %d < 50 after dump, waiting for full sync", diff)
-				}
-				waitForSync(sigCtx, ethService)
-				if verboseLog {
-					log.Printf("Full sync reached, performing additional full dump with progress")
-				}
-				dumpAllByPrefix(ethService, outDir)
+	prog := ethService.Downloader().Progress()
+	if head != nil && prog.CurrentBlock < prog.HighestBlock {
+		diff := prog.HighestBlock - prog.CurrentBlock
+		if diff < 50 {
+			if verboseLog {
+				log.Printf("Current block difference %d < 50 after dump, waiting for full sync", diff)
 			}
+			waitForSync(sigCtx, ethService)
+			if verboseLog {
+				log.Printf("Full sync reached, performing additional full dump with progress")
+			}
+			dumpAllByPrefix(ethService, outDir)
 		}
+
 	}
 
 	// Subscribe to chain head events for incremental updates
@@ -154,16 +153,22 @@ func runDumpBalances(ctx *cli.Context) error {
 	sub := ethService.BlockChain().SubscribeChainHeadEvent(headCh)
 	defer sub.Unsubscribe()
 
-	// Process new head events
 	for {
 		select {
 		case ev := <-headCh:
+			// New chain head event
 			if header := ev.Header; header != nil {
+				// Get block by header hash
+				// and perform incremental update
 				if blk := ethService.BlockChain().GetBlockByHash(header.Hash()); blk != nil {
 					incrementalUpdate(ethService, blk, outDir)
 				}
 			}
+		case err := <-sub.Err():
+			log.Printf("Chain head subscription error: %v", err)
+			return fmt.Errorf("подписка на новые блоки прервана: %w", err)
 		case <-sigCtx.Done():
+			// SIGINT/SIGTERM – OUT
 			return nil
 		}
 	}
@@ -274,7 +279,7 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 
 	// 4) Start worker
 	root := head.Root
-	db := service.BlockChain().TrieDB()
+
 	for id := 0; id < numWorkers; id++ {
 		wg.Add(1)
 		go func(workerID int, ch <-chan account) {
@@ -331,7 +336,7 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 
 	// 5) Single pass through the entire trie, sharding by prefix%numWorkers
 	stateDB, _ := service.BlockChain().StateAt(root)
-	tr, _ := trie.New(trie.StateTrieID(root), db)
+	tr, _ := trie.New(trie.StateTrieID(root), service.BlockChain().TrieDB())
 	iter, _ := tr.NodeIterator(nil)
 	it := trie.NewIterator(iter)
 
@@ -348,18 +353,22 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 				processed, speed, totalElapsed)
 			lastLog = time.Now()
 		}
-		key := it.Key
-		addr := common.BytesToAddress(key)
+		hash := it.Key
+		orig := service.BlockChain().TrieDB().Preimage(common.BytesToHash(hash))
+		if orig == nil {
+			continue // No saved preimage, Skip
+		}
+		addr := common.BytesToAddress(orig)
 		p := int(addr.Bytes()[0])
 		if done[p] {
 			continue
 		}
-		bal := stateDB.GetBalance(common.BytesToAddress(key)).ToBig()
+		bal := stateDB.GetBalance(addr).ToBig()
 		if bal.Sign() == 0 {
 			continue
 		}
 		idx := p % numWorkers
-		chs[idx] <- account{prefix: p, addr: common.BytesToAddress(key), bal: bal}
+		chs[idx] <- account{prefix: idx, addr: addr, bal: bal}
 		total++
 	}
 
