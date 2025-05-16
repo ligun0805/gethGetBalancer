@@ -336,8 +336,18 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 	it := trie.NewIterator(iter)
 
 	log.Printf("Starting iteration now…")
-	var total int
+	var total, processed int
+	lastLog := time.Now()
 	for it.Next() {
+		processed++
+		if processed%500_000 == 0 {
+			elapsed := time.Since(lastLog).Seconds()
+			speed := float64(500_000) / elapsed
+			totalElapsed := time.Since(start).Seconds()
+			log.Printf("Iteration: %d keys processed (%.0f keys/sec), total elapsed %.0f s",
+				processed, speed, totalElapsed)
+			lastLog = time.Now()
+		}
 		key := it.Key
 		p := int(key[0])
 		if done[p] {
