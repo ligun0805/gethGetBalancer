@@ -236,159 +236,139 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 	start := time.Now()
 	log.Printf("▶ Start full dump...")
 
-	// Choose number of workers based on CPU count
-	// Use 75% of available CPU cores for workers
-	numCPU := runtime.NumCPU()
-	numWorkers := int(float64(numCPU) * 0.75)
-	if numWorkers < 1 {
-		numWorkers = 1
-	}
-	if verboseLog {
-		log.Printf("Full dump using %d workers (CPU: %d)", numWorkers, numCPU)
-	}
-
-	// Load progress from file
-	progress, err := loadProgress(outDir)
-	if err != nil {
-		progress = &DumpProgress{PrefixesDone: []int{}}
-	}
-	done := make(map[int]bool, len(progress.PrefixesDone))
-	for _, p := range progress.PrefixesDone {
-		done[p] = true
-	}
-
+	// 1) Determine the current block and reset the progress if it is from another block
 	head := service.BlockChain().CurrentHeader()
 	if head == nil {
 		log.Printf("Failed to get current header for dump")
 		return
 	}
+	currentBlock := head.Number.Uint64()
 
-	// Prepare channels for workers
-	// Use a buffered channel to avoid blocking on writes
-	type account struct {
-		prefix int
-		addr   common.Address
-		bal    *big.Int
+	progress, err := loadProgress(outDir)
+	if err != nil {
+		progress = &DumpProgress{Block: currentBlock}
 	}
-	chs := make([]chan account, numWorkers)
-	for i := range chs {
-		chs[i] = make(chan account, 100_000)
+	if progress.Block != currentBlock {
+		log.Printf("Progress file block %d ≠ current %d → сбрасываем PrefixesDone", progress.Block, currentBlock)
+		progress = &DumpProgress{Block: currentBlock}
 	}
 
-	var progressLock sync.Mutex
+	// 2) Determine the number of workers
+	numCPU := runtime.NumCPU()
+	numWorkers := int(float64(numCPU) * 0.75)
+	if numWorkers < 1 {
+		numWorkers = 1
+	}
+	log.Printf("Full dump using %d workers (CPU: %d)", numWorkers, numCPU)
+
+	// 3) Assembling Goroutines: Distribute 256 Prefixes Equally
+	prefixes := make([][]byte, numWorkers)
+	for p := 0; p < 256; p++ {
+		// If prefix already in progress, skip it
+		skip := false
+		for _, doneP := range progress.PrefixesDone {
+			if doneP == p {
+				skip = true
+				break
+			}
+		}
+		if skip {
+			continue
+		}
+		workerID := p % numWorkers
+		prefixes[workerID] = append(prefixes[workerID], byte(p))
+	}
+
 	var wg sync.WaitGroup
+	var progressLock sync.Mutex
+	db := service.BlockChain().TrieDB()
+	root := head.Root
 
-	// Start worker goroutines
-	for workerID := 0; workerID < numWorkers; workerID++ {
-		ch := chs[workerID]
+	// 4) Start new prefix workers
+	for workerID, prefList := range prefixes {
+		if len(prefList) == 0 {
+			continue
+		}
 		wg.Add(1)
-		go func(workerID int, ch <-chan account) {
+		go func(workerID int, list []byte) {
 			defer wg.Done()
-			writers := make(map[int]*bufio.Writer)
-			files := make(map[int]*os.File)
-			prefixCount := make(map[int]int)
-			prefixStart := make(map[int]time.Time)
+			for _, p := range list {
+				// Log for starting prefix
+				log.Printf("[worker %02d] → start prefix %02x", workerID, p)
+				ps := []byte{p}
 
-			for acc := range ch {
-				p := acc.prefix
-				if _, ok := writers[p]; !ok {
-					// Worker is starting to process a new prefix
-					tmp := filepath.Join(outDir, fmt.Sprintf("%02x.tmp", p))
-					f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
-					if err != nil {
-						if verboseLog {
-							log.Printf("[worker %02d] error opening tmp %s: %v", workerID, tmp, err)
-						}
+				// 4.1) Iterator по префиксу
+				tr, err := trie.New(trie.StateTrieID(root), db)
+				if err != nil {
+					log.Printf("[worker %02d] trie.New error: %v", workerID, err)
+					continue
+				}
+				nodeIt, err := tr.NodeIterator(ps)
+				if err != nil {
+					log.Printf("[worker %02d] NodeIterator error: %v", workerID, err)
+					continue
+				}
+				iter := trie.NewIterator(nodeIt)
+
+				// 4.2) Prepare output file
+				tmpPath := filepath.Join(outDir, fmt.Sprintf("%02x.tmp", p))
+				f, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
+				if err != nil {
+					log.Printf("[worker %02d] open tmp %s: %v", workerID, tmpPath, err)
+					continue
+				}
+				w := bufio.NewWriter(f)
+
+				count := 0
+				startP := time.Now()
+
+				stateDB, _ := service.BlockChain().StateAt(root)
+				for iter.Next() {
+					addr := common.BytesToAddress(iter.Key)
+					bal := stateDB.GetBalance(addr)
+					if bal == nil {
 						continue
 					}
-					writers[p] = bufio.NewWriter(f)
-					files[p] = f
-					// Log for start prefix
-					log.Printf("[worker %02d] → start prefix %02x", workerID, p)
-					prefixStart[p] = time.Now()
-					prefixCount[p] = 0
+					bb := bal.ToBig()
+					if bb.Sign() == 0 {
+						continue
+					}
+					w.WriteString(addr.Hex() + "\t" + formatBalance(bb) + "\n")
+					count++
 				}
-				balStr := formatBalance(acc.bal)
-				writers[p].WriteString(acc.addr.Hex() + "\t" + balStr + "\n")
-				prefixCount[p]++
-				if verboseLog {
-					log.Printf("[worker %02d] ADDR: %s BAL: %s", workerID, acc.addr.Hex(), balStr)
-				}
-			}
 
-			// After closing channels — flush/sort и final log
-			for p, w := range writers {
+				// 4.3) Flush → sort → rename
 				w.Flush()
-				files[p].Close()
-				tmp := filepath.Join(outDir, fmt.Sprintf("%02x.tmp", p))
-				final := filepath.Join(outDir, fmt.Sprintf("%02x.txt", p))
-				if err := sortFileByBalance(tmp); err != nil {
-					log.Printf("[worker %02d] sort error for %s: %v", workerID, tmp, err)
+				f.Close()
+				finalPath := filepath.Join(outDir, fmt.Sprintf("%02x.txt", p))
+				if err := sortFileByBalance(tmpPath); err != nil {
+					log.Printf("[worker %02d] sort error %s: %v", workerID, tmpPath, err)
 				}
-				if err := os.Rename(tmp, final); err != nil {
-					log.Printf("[worker %02d] rename %s -> %s: %v", workerID, tmp, final, err)
+				if err := os.Rename(tmpPath, finalPath); err != nil {
+					log.Printf("[worker %02d] rename %s→%s: %v", workerID, tmpPath, finalPath, err)
 				}
-				accountsProcessed.Inc()
+				accountsProcessed.Add(float64(count))
 
-				// final log
-				if !verboseLog {
-					elapsed := time.Since(prefixStart[p]).Seconds()
-					log.Printf("[worker %02d] ← done prefix  %02x (%d addr, %.0f s)",
-						workerID, p, prefixCount[p], elapsed)
-				} else {
-					log.Printf("[worker %02d] finished prefix %02x", workerID, p)
-				}
+				// 4.4) Log for finishing prefix
+				elapsed := time.Since(startP).Seconds()
+				log.Printf("[worker %02d] ← done prefix  %02x (%d addr, %.0f s)",
+					workerID, p, count, elapsed)
 
-				// save progress
+				// 4.5) Save progress
 				progressLock.Lock()
-				progress.PrefixesDone = append(progress.PrefixesDone, p)
+				progress.PrefixesDone = append(progress.PrefixesDone, int(p))
 				saveProgress(outDir, progress)
 				progressLock.Unlock()
 			}
-		}(workerID, ch)
+		}(workerID, prefList)
 	}
 
-	// Main loop: iterate over trie nodes
-	// and send non-zero balances to workers
-	stateDB, _ := service.BlockChain().StateAt(head.Root)
-	tr, _ := trie.New(trie.StateTrieID(head.Root), service.BlockChain().TrieDB())
-	nodeIt, err := tr.NodeIterator(nil)
-	if err != nil {
-		log.Printf("NodeIterator error: %v", err)
-		return
-	}
-	iter := trie.NewIterator(nodeIt)
-	if verboseLog {
-		log.Printf("Starting iteration...")
-	}
-	var nonZero int
-	for iter.Next() {
-		key := iter.Key
-		p := int(key[0])
-		if done[p] {
-			continue
-		}
-		bal256 := stateDB.GetBalance(common.BytesToAddress(key))
-		if bal256 == nil {
-			continue
-		}
-		bal := bal256.ToBig()
-		if bal == nil || bal.Sign() == 0 {
-			continue
-		}
-		chs[p%numWorkers] <- account{prefix: p, addr: common.BytesToAddress(key), bal: bal}
-		nonZero++
-	}
-
-	// Close all channels and wait for workers to finish
-	for i := range chs {
-		close(chs[i])
-	}
+	// 5) Waiting for all workers to finish
 	wg.Wait()
 
 	fullDumpDuration.Observe(time.Since(start).Seconds())
-	log.Printf("✅ Full dump finished in %.0f s, saved %d addresses",
-		time.Since(start).Seconds(), nonZero)
+	log.Printf("✅ Full dump finished in %.0f s, total prefixes: %d",
+		time.Since(start).Seconds(), len(progress.PrefixesDone))
 }
 
 // removeAddresses removes lines with given addresses from the file at mainPath
