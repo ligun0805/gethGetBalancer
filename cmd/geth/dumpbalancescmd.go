@@ -236,7 +236,8 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 	start := time.Now()
 	log.Printf("▶ Start full dump...")
 
-	// 1) Pick number of workers
+	// Choose number of workers based on CPU count
+	// Use 75% of available CPU cores for workers
 	numCPU := runtime.NumCPU()
 	numWorkers := int(float64(numCPU) * 0.75)
 	if numWorkers < 1 {
@@ -246,7 +247,7 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 		log.Printf("Full dump using %d workers (CPU: %d)", numWorkers, numCPU)
 	}
 
-	// 2) load recent progress after skip
+	// Load progress from file
 	progress, err := loadProgress(outDir)
 	if err != nil {
 		progress = &DumpProgress{PrefixesDone: []int{}}
@@ -262,7 +263,8 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 		return
 	}
 
-	// 3) Prepare channels and workers
+	// Prepare channels for workers
+	// Use a buffered channel to avoid blocking on writes
 	type account struct {
 		prefix int
 		addr   common.Address
@@ -270,16 +272,17 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 	}
 	chs := make([]chan account, numWorkers)
 	for i := range chs {
-		chs[i] = make(chan account, 100_000) // Big enough buffer to avoid blocking
+		chs[i] = make(chan account, 100_000)
 	}
 
 	var progressLock sync.Mutex
 	var wg sync.WaitGroup
 
-	// 4) Start workers
-	for i := 0; i < numWorkers; i++ {
+	// Start worker goroutines
+	for workerID := 0; workerID < numWorkers; workerID++ {
+		ch := chs[workerID]
 		wg.Add(1)
-		go func(ch <-chan account) {
+		go func(workerID int, ch <-chan account) {
 			defer wg.Done()
 			writers := make(map[int]*bufio.Writer)
 			files := make(map[int]*os.File)
@@ -289,19 +292,19 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 			for acc := range ch {
 				p := acc.prefix
 				if _, ok := writers[p]; !ok {
+					// Worker is starting to process a new prefix
 					tmp := filepath.Join(outDir, fmt.Sprintf("%02x.tmp", p))
 					f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o640)
 					if err != nil {
 						if verboseLog {
-							log.Printf("Error creating tmp file %s: %v", tmp, err)
+							log.Printf("[worker %02d] error opening tmp %s: %v", workerID, tmp, err)
 						}
 						continue
 					}
 					writers[p] = bufio.NewWriter(f)
 					files[p] = f
-					if !verboseLog {
-						log.Printf("Started dumping prefix %02x", p)
-					}
+					// Log for start prefix
+					log.Printf("[worker %02d] → start prefix %02x", workerID, p)
 					prefixStart[p] = time.Now()
 					prefixCount[p] = 0
 				}
@@ -309,43 +312,51 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 				writers[p].WriteString(acc.addr.Hex() + "\t" + balStr + "\n")
 				prefixCount[p]++
 				if verboseLog {
-					log.Printf("ADDR: %s BAL: %s", acc.addr.Hex(), balStr)
+					log.Printf("[worker %02d] ADDR: %s BAL: %s", workerID, acc.addr.Hex(), balStr)
 				}
 			}
 
-			// 5) After finishing the channel — flush/sort for every prefix
+			// After closing channels — flush/sort и final log
 			for p, w := range writers {
 				w.Flush()
 				files[p].Close()
 				tmp := filepath.Join(outDir, fmt.Sprintf("%02x.tmp", p))
 				final := filepath.Join(outDir, fmt.Sprintf("%02x.txt", p))
 				if err := sortFileByBalance(tmp); err != nil {
-					log.Printf("sort error for %s: %v", tmp, err)
+					log.Printf("[worker %02d] sort error for %s: %v", workerID, tmp, err)
 				}
 				if err := os.Rename(tmp, final); err != nil {
-					log.Printf("rename %s -> %s: %v", tmp, final, err)
+					log.Printf("[worker %02d] rename %s -> %s: %v", workerID, tmp, final, err)
 				}
 				accountsProcessed.Inc()
+
+				// final log
 				if !verboseLog {
-					log.Printf("Finished dumping prefix %02x", p)
 					elapsed := time.Since(prefixStart[p]).Seconds()
-					log.Printf("Saved %d addresses in %.0f s", prefixCount[p], elapsed)
+					log.Printf("[worker %02d] ← done prefix  %02x (%d addr, %.0f s)",
+						workerID, p, prefixCount[p], elapsed)
 				} else {
-					log.Printf("Finished prefix %02x", p)
+					log.Printf("[worker %02d] finished prefix %02x", workerID, p)
 				}
-				// 6) Save progress securely
+
+				// save progress
 				progressLock.Lock()
 				progress.PrefixesDone = append(progress.PrefixesDone, p)
 				saveProgress(outDir, progress)
 				progressLock.Unlock()
 			}
-		}(chs[i])
+		}(workerID, ch)
 	}
 
-	// 7) Main iteration trie cycle
+	// Main loop: iterate over trie nodes
+	// and send non-zero balances to workers
 	stateDB, _ := service.BlockChain().StateAt(head.Root)
 	tr, _ := trie.New(trie.StateTrieID(head.Root), service.BlockChain().TrieDB())
 	nodeIt, err := tr.NodeIterator(nil)
+	if err != nil {
+		log.Printf("NodeIterator error: %v", err)
+		return
+	}
 	iter := trie.NewIterator(nodeIt)
 	if verboseLog {
 		log.Printf("Starting iteration...")
@@ -355,7 +366,7 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 		key := iter.Key
 		p := int(key[0])
 		if done[p] {
-			continue // Skip already processed prefixes
+			continue
 		}
 		bal256 := stateDB.GetBalance(common.BytesToAddress(key))
 		if bal256 == nil {
@@ -369,14 +380,15 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 		nonZero++
 	}
 
-	// 8) Close all channels and wait for workers to finish
+	// Close all channels and wait for workers to finish
 	for i := range chs {
 		close(chs[i])
 	}
 	wg.Wait()
 
 	fullDumpDuration.Observe(time.Since(start).Seconds())
-	log.Printf("✅ Full dump finished in %.0f s, saved %d addresses", time.Since(start).Seconds(), nonZero)
+	log.Printf("✅ Full dump finished in %.0f s, saved %d addresses",
+		time.Since(start).Seconds(), nonZero)
 }
 
 // removeAddresses removes lines with given addresses from the file at mainPath
