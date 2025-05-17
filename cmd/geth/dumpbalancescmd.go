@@ -525,11 +525,11 @@ func sortFileByBalance(path string) error {
 		return fmt.Errorf("open %s: %w", path, err)
 	}
 	defer f.Close()
-	type line struct {
+	type entry struct {
 		addr string
 		bal  *big.Rat
 	}
-	var lines []line
+	unique := make(map[string]*big.Rat)
 	scanner := bufio.NewScanner(f)
 	for scanner.Scan() {
 		var a, b string
@@ -540,12 +540,16 @@ func sortFileByBalance(path string) error {
 		if !ok {
 			continue
 		}
-		lines = append(lines, line{addr: a, bal: r})
+		unique[a] = r
 	}
 	if err := scanner.Err(); err != nil {
 		return fmt.Errorf("scan %s: %w", path, err)
 	}
-	sort.Slice(lines, func(i, j int) bool { return lines[i].bal.Cmp(lines[j].bal) > 0 })
+	entries := make([]entry, 0, len(unique))
+	for addr, bal := range unique {
+		entries = append(entries, entry{addr: addr, bal: bal})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].bal.Cmp(entries[j].bal) > 0 })
 	sorted := path + ".sorted"
 	f2, err := os.Create(sorted)
 	if err != nil {
@@ -553,7 +557,7 @@ func sortFileByBalance(path string) error {
 	}
 	defer f2.Close()
 	w2 := bufio.NewWriter(f2)
-	for _, l := range lines {
+	for _, l := range entries {
 		w2.WriteString(l.addr + "\t" + l.bal.FloatString(18) + "\n")
 	}
 	if err := w2.Flush(); err != nil {
