@@ -130,26 +130,9 @@ func runDumpBalances(ctx *cli.Context) error {
 	time.Sleep(15 * time.Second)
 	dumpAllByPrefix(ethService, outDir)
 
-	// After full dump, check sync state
-	head := ethService.BlockChain().CurrentHeader()
-	prog := ethService.Downloader().Progress()
-	if head != nil && prog.CurrentBlock < prog.HighestBlock {
-		diff := prog.HighestBlock - prog.CurrentBlock
-		if diff < 50 {
-			if verboseLog {
-				log.Printf("Current block difference %d < 50 after dump, waiting for full sync", diff)
-			}
-			waitForSync(sigCtx, ethService)
-			if verboseLog {
-				log.Printf("Full sync reached, performing additional full dump with progress")
-			}
-			dumpAllByPrefix(ethService, outDir)
-		}
-
-	}
-
 	// Subscribe to chain head events for incremental updates
 	headCh := make(chan core.ChainHeadEvent)
+	log.Printf("Starting chain head subscription...")
 	sub := ethService.BlockChain().SubscribeChainHeadEvent(headCh)
 	defer sub.Unsubscribe()
 
@@ -166,7 +149,7 @@ func runDumpBalances(ctx *cli.Context) error {
 			}
 		case err := <-sub.Err():
 			log.Printf("Chain head subscription error: %v", err)
-			return fmt.Errorf("подписка на новые блоки прервана: %w", err)
+			return fmt.Errorf("subscription to new blocks interrupted: %w", err)
 		case <-sigCtx.Done():
 			// SIGINT/SIGTERM – OUT
 			return nil
@@ -368,7 +351,7 @@ func dumpAllByPrefix(service *eth.Ethereum, outDir string) {
 			continue
 		}
 		idx := p % numWorkers
-		chs[idx] <- account{prefix: idx, addr: addr, bal: bal}
+		chs[idx] <- account{prefix: p, addr: addr, bal: bal}
 		total++
 	}
 
