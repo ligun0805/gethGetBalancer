@@ -110,9 +110,9 @@ func runDumpBalances(ctx *cli.Context) error {
 	utils.SetEthConfig(ctx, stack, &ethCfg)
 
 	// Register Ethereum service and related APIs
-	backend, ethService := utils.RegisterEthService(stack, &ethCfg)
-	filterSystem := utils.RegisterFilterAPI(stack, backend, &ethCfg)
-	utils.RegisterGraphQLService(stack, backend, filterSystem, &nodeCfg)
+	apiBackend, ethService := utils.RegisterEthService(stack, &ethCfg)
+	filterSystem := utils.RegisterFilterAPI(stack, apiBackend, &ethCfg)
+	utils.RegisterGraphQLService(stack, apiBackend, filterSystem, &nodeCfg)
 
 	// Start node: P2P, RPC, WS, GraphQL
 	utils.StartNode(ctx, stack, false)
@@ -121,15 +121,19 @@ func runDumpBalances(ctx *cli.Context) error {
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Wait for initial sync to complete
-	waitForSyncWithTolerance(sigCtx, ethService, 1, 30*time.Second)
+	// Wait for state-sync (snap + catch-up) to finish
+	waitForSync(sigCtx, ethService)
+	// Wait for snap / state sync to finish too
+	waitForStateSync(sigCtx, apiBackend, 10*time.Second)
 	fmt.Println("✅ Initial sync complete, starting full dump")
 
 	// Perform full state dump
 	fmt.Println("Waiting extra 15s to ensure trie state loaded...")
 	time.Sleep(15 * time.Second)
 	dumpAllByPrefix(ethService, outDir)
-	waitForSyncWithTolerance(sigCtx, ethService, 1, 30*time.Second)
+
+	// After dump check if we need to wait for the node to be fully synced
+	waitForStateSync(sigCtx, apiBackend, 10*time.Second)
 	log.Printf("✅ Node is now fully in sync, subscribing to new head events…")
 
 	// Subscribe to chain head events for incremental updates
@@ -160,26 +164,47 @@ func runDumpBalances(ctx *cli.Context) error {
 	}
 }
 
-// waitForSync polls sync progress until complete
-func waitForSyncWithTolerance(ctx context.Context, service *eth.Ethereum, toleranceBlocks uint64, timeout time.Duration) {
-	deadline := time.NewTimer(timeout)
-	ticker := time.NewTicker(5 * time.Second)
-	defer deadline.Stop()
+// waitForSync polls the downloader until the node has fully caught up on blocks.
+func waitForSync(ctx context.Context, service *eth.Ethereum) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// shut down early on SIGINT/SIGTERM
+			return
+		case <-ticker.C:
+			prog := service.Downloader().Progress()
+			log.Printf("Syncing blocks: %d / %d", prog.CurrentBlock, prog.HighestBlock)
+			if prog.CurrentBlock >= prog.HighestBlock {
+				// we’ve fully caught up on headers & bodies
+				return
+			}
+		}
+	}
+}
+
+// waitForStateSync опрашивает RPC eth.syncing пока не вернёт nil (т. е. sync complete)
+func waitForStateSync(ctx context.Context, backend *eth.EthAPIBackend, pollInterval time.Duration) {
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-deadline.C:
-			log.Printf("Sync timeout reached, proceeding anyway")
-			return
 		case <-ticker.C:
-			prog := service.Downloader().Progress()
-			log.Printf("Syncing: %d/%d (tolerance %d)", prog.CurrentBlock, prog.HighestBlock, toleranceBlocks)
-			if prog.HighestBlock <= prog.CurrentBlock+toleranceBlocks {
-				log.Printf("Sync reached within tolerance (%d blocks), proceeding", toleranceBlocks)
-				return
-			}
 		}
+		prog := backend.SyncProgress(ctx)
+		if prog.CurrentBlock == 0 && prog.HighestBlock == 0 {
+			log.Println("State sync complete")
+			return
+		}
+		// Log current state sync status
+		log.Printf("State syncing: start=%d current=%d highest=%d pulledStates=%d knownStates=%d",
+			prog.StartingBlock, prog.CurrentBlock, prog.HighestBlock,
+			prog.PulledStates, prog.KnownStates,
+		)
 	}
 }
 
