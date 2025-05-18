@@ -121,90 +121,48 @@ func runDumpBalances(ctx *cli.Context) error {
 	sigCtx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Wait for state-sync (snap + catch-up) to finish
-	waitForSync(sigCtx, ethService)
-	// Wait for snap / state sync to finish too
-	waitForStateSync(sigCtx, apiBackend, 10*time.Second)
-	fmt.Println("✅ Initial sync complete, starting full dump")
+	// ▶ Стартуем полную вгрузку и инкрементальные обновления сразу
+	fmt.Println("▶ Starting full dump (resume) and incremental updates…")
 
-	// Perform full state dump
-	fmt.Println("Waiting extra 15s to ensure trie state loaded...")
-	time.Sleep(15 * time.Second)
-	dumpAllByPrefix(ethService, outDir)
+	// 1) Читаем последний сохранённый прогресс по блоку
+	progress, err := loadProgress(outDir)
+	if err != nil {
+		progress = &DumpProgress{Block: 0}
+	}
+	lastBlock := progress.Block
 
-	// After dump check if we need to wait for the node to be fully synced
-	waitForStateSync(sigCtx, apiBackend, 10*time.Second)
-	log.Printf("✅ Node is now fully in sync, subscribing to new head events…")
+	// 2) Полный дамп (самостоятельно резюмирует PrefixesDone)
+	go dumpAllByPrefix(ethService, outDir)
 
-	// Subscribe to chain head events for incremental updates
+	// 3) Подписка на новые блоки
+	log.Printf("▶ Subscribing to new head events…")
 	headCh := make(chan core.ChainHeadEvent, 16)
-	log.Printf("Starting chain head subscription...")
 	sub := ethService.BlockChain().SubscribeChainHeadEvent(headCh)
 	defer sub.Unsubscribe()
 
+	// 4) Обработка новых хэдеров
 	for {
 		select {
 		case ev := <-headCh:
-			// New chain head event
-			log.Printf("→ got new head event: block %d hash=%s", ev.Header.Number.Uint64(), ev.Header.Hash().Hex())
-			if header := ev.Header; header != nil {
-				// Get block by header hash
-				// and perform incremental update
-				if blk := ethService.BlockChain().GetBlockByHash(header.Hash()); blk != nil {
-					incrementalUpdate(ethService, blk, outDir)
-				}
+			number := ev.Header.Number.Uint64()
+			// пропускаем те, что уже были
+			if number <= lastBlock {
+				continue
 			}
+			blk := ethService.BlockChain().GetBlockByHash(ev.Header.Hash())
+			if blk == nil {
+				incrementalUpdate(ethService, blk, outDir)
+			}
+			// сохраняем новый прогресс по блоку
+			progress.Block = number
+			saveProgress(outDir, progress)
+			lastBlock = number
+
 		case err := <-sub.Err():
-			log.Printf("Chain head subscription error: %v", err)
-			return fmt.Errorf("subscription to new blocks interrupted: %w", err)
+			return fmt.Errorf("chain head subscription failed: %w", err)
 		case <-sigCtx.Done():
-			// SIGINT/SIGTERM – OUT
 			return nil
 		}
-	}
-}
-
-// waitForSync polls the downloader until the node has fully caught up on blocks.
-func waitForSync(ctx context.Context, service *eth.Ethereum) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			// shut down early on SIGINT/SIGTERM
-			return
-		case <-ticker.C:
-			prog := service.Downloader().Progress()
-			log.Printf("Syncing blocks: %d / %d", prog.CurrentBlock, prog.HighestBlock)
-			if prog.CurrentBlock >= prog.HighestBlock {
-				// we’ve fully caught up on headers & bodies
-				return
-			}
-		}
-	}
-}
-
-// waitForStateSync опрашивает RPC eth.syncing пока не вернёт nil (т. е. sync complete)
-func waitForStateSync(ctx context.Context, backend *eth.EthAPIBackend, pollInterval time.Duration) {
-	ticker := time.NewTicker(pollInterval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-		}
-		prog := backend.SyncProgress(ctx)
-		if prog.CurrentBlock == 0 && prog.HighestBlock == 0 {
-			log.Println("State sync complete")
-			return
-		}
-		// Log current state sync status
-		log.Printf("State syncing: start=%d current=%d highest=%d pulledStates=%d knownStates=%d",
-			prog.StartingBlock, prog.CurrentBlock, prog.HighestBlock,
-			prog.PulledStates, prog.KnownStates,
-		)
 	}
 }
 
