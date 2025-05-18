@@ -122,16 +122,18 @@ func runDumpBalances(ctx *cli.Context) error {
 	defer cancel()
 
 	// Wait for initial sync to complete
-	waitForSync(sigCtx, ethService)
+	waitForSyncWithTolerance(sigCtx, ethService, 1, 30*time.Second)
 	fmt.Println("✅ Initial sync complete, starting full dump")
 
 	// Perform full state dump
 	fmt.Println("Waiting extra 15s to ensure trie state loaded...")
 	time.Sleep(15 * time.Second)
 	dumpAllByPrefix(ethService, outDir)
+	waitForSyncWithTolerance(sigCtx, ethService, 1, 30*time.Second)
+	log.Printf("✅ Node is now fully in sync, subscribing to new head events…")
 
 	// Subscribe to chain head events for incremental updates
-	headCh := make(chan core.ChainHeadEvent)
+	headCh := make(chan core.ChainHeadEvent, 16)
 	log.Printf("Starting chain head subscription...")
 	sub := ethService.BlockChain().SubscribeChainHeadEvent(headCh)
 	defer sub.Unsubscribe()
@@ -140,6 +142,7 @@ func runDumpBalances(ctx *cli.Context) error {
 		select {
 		case ev := <-headCh:
 			// New chain head event
+			log.Printf("→ got new head event: block %d hash=%s", ev.Header.Number.Uint64(), ev.Header.Hash().Hex())
 			if header := ev.Header; header != nil {
 				// Get block by header hash
 				// and perform incremental update
@@ -158,17 +161,22 @@ func runDumpBalances(ctx *cli.Context) error {
 }
 
 // waitForSync polls sync progress until complete
-func waitForSync(ctx context.Context, service *eth.Ethereum) {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+func waitForSyncWithTolerance(ctx context.Context, service *eth.Ethereum, toleranceBlocks uint64, timeout time.Duration) {
+	deadline := time.NewTimer(timeout)
+	ticker := time.NewTicker(5 * time.Second)
+	defer deadline.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-deadline.C:
+			log.Printf("Sync timeout reached, proceeding anyway")
+			return
 		case <-ticker.C:
 			prog := service.Downloader().Progress()
-			log.Printf("Syncing: %d/%d", prog.CurrentBlock, prog.HighestBlock)
-			if prog.CurrentBlock >= prog.HighestBlock {
+			log.Printf("Syncing: %d/%d (tolerance %d)", prog.CurrentBlock, prog.HighestBlock, toleranceBlocks)
+			if prog.HighestBlock <= prog.CurrentBlock+toleranceBlocks {
+				log.Printf("Sync reached within tolerance (%d blocks), proceeding", toleranceBlocks)
 				return
 			}
 		}
