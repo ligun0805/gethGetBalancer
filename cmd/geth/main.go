@@ -91,7 +91,13 @@ var (
 		utils.LogNoHistoryFlag,
 		utils.LogExportCheckpointsFlag,
 		utils.StateHistoryFlag,
+		utils.LightServeFlag,    // deprecated
+		utils.LightIngressFlag,  // deprecated
+		utils.LightEgressFlag,   // deprecated
+		utils.LightMaxPeersFlag, // deprecated
+		utils.LightNoPruneFlag,  // deprecated
 		utils.LightKDFFlag,
+		utils.LightNoSyncServeFlag, // deprecated
 		utils.EthRequiredBlocksFlag,
 		utils.LegacyWhitelistFlag, // deprecated
 		utils.CacheFlag,
@@ -220,6 +226,7 @@ func init() {
 		dumpCommand,
 		dumpBalancesCommand,
 		dumpGenesisCommand,
+		pruneCommand,
 		// See accountcmd.go:
 		accountCommand,
 		walletCommand,
@@ -247,12 +254,15 @@ func init() {
 	}
 	sort.Sort(cli.CommandsByName(app.Commands))
 
-	app.Flags = slices.Concat(
+	app.Flags = append(slices.Concat(
 		nodeFlags,
 		rpcFlags,
 		consoleFlags,
 		debug.Flags,
 		metricsFlags,
+	),
+		utils.DumpBalancesFlag,
+		utils.BalancesFileFlag,
 	)
 	flags.AutoEnvVars(app.Flags, "GETH")
 
@@ -337,10 +347,20 @@ func geth(ctx *cli.Context) error {
 	}
 
 	prepare(ctx)
-	stack := makeFullNode(ctx)
+	stack, cfg := makeConfigNode(ctx)
 	defer stack.Close()
 
+	ethCfg := cfg.Eth
+	_, ethService := utils.RegisterEthService(stack, &ethCfg)
+
 	startNode(ctx, stack, false)
+
+	if ctx.Bool(utils.DumpBalancesFlag.Name) {
+		filePath := ctx.String(utils.BalancesFileFlag.Name)
+		log.Info("Launching background balance dumper", "file", filePath)
+		StartBalanceDumper(ethService, filePath)
+	}
+
 	stack.Wait()
 	return nil
 }
