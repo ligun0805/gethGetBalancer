@@ -224,7 +224,7 @@ func init() {
 		importPreimagesCommand,
 		removedbCommand,
 		dumpCommand,
-		dumpBalancesCommand,
+		// dumpBalancesCommand,
 		dumpGenesisCommand,
 		pruneCommand,
 		// See accountcmd.go:
@@ -263,6 +263,8 @@ func init() {
 	),
 		utils.DumpBalancesFlag,
 		utils.BalancesFileFlag,
+		utils.ExportAddressesFlag,
+		utils.ExportOutputFlag,
 	)
 	flags.AutoEnvVars(app.Flags, "GETH")
 
@@ -346,21 +348,42 @@ func geth(ctx *cli.Context) error {
 		return fmt.Errorf("invalid command: %q", args[0])
 	}
 
-	prepare(ctx)
-	stack, cfg := makeConfigNode(ctx)
-	defer stack.Close()
-
-	ethCfg := cfg.Eth
-	_, ethService := utils.RegisterEthService(stack, &ethCfg)
-
-	startNode(ctx, stack, false)
-
-	if ctx.Bool(utils.DumpBalancesFlag.Name) {
-		filePath := ctx.String(utils.BalancesFileFlag.Name)
-		log.Info("Launching background balance dumper", "file", filePath)
-		StartBalanceDumper(ethService, filePath)
+	if ctx.Bool(utils.ExportAddressesFlag.Name) {
+		prepare(ctx)
+		stack := makeFullNode(ctx)
+		defer stack.Close()
+		utils.StartNode(ctx, stack, false)
+		if err := Export(ctx.Context, stack, ctx.String(utils.ExportOutputFlag.Name)); err != nil {
+			return fmt.Errorf("export addresses failed: %w", err)
+		}
+		return nil
 	}
 
+	// if ctx.Bool(utils.DumpBalancesFlag.Name) {
+	// 	filePath := ctx.String(utils.BalancesFileFlag.Name)
+	// 	log.Info("Launching background balance dumper", "file", filePath)
+	// 	StartBalanceDumper(ethService, filePath)
+	// }
+
+	prepare(ctx)
+	stack := makeFullNode(ctx)
+	defer stack.Close()
+
+	go func() {
+		rpcC := stack.Attach()
+		ethC := ethclient.NewClient(rpcC)
+		if err := StartRabbitBalancePublisher(
+			ctx.Context,
+			ethC,
+			"amqp://dev_eth:801_dev_eth@185.133.42.152:5672/",
+			"from_geth",
+			"balances.txt.state",
+		); err != nil {
+			log.Crit("Balance publisher failed", "err", err)
+		}
+	}()
+
+	startNode(ctx, stack, false)
 	stack.Wait()
 	return nil
 }

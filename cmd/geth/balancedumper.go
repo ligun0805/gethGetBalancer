@@ -1,4 +1,3 @@
-// Файл: cmd/geth/balancedumper.go
 package main
 
 import (
@@ -6,6 +5,8 @@ import (
 	"fmt"
 	"math/big"
 	"os"
+	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -15,7 +16,6 @@ import (
 )
 
 // StartBalanceDumper starts the background balance dumper.
-// ethService – Ethereum service from the node stack, filePath – path to the file to save.
 func StartBalanceDumper(ethService *eth.Ethereum, filePath string) {
 	go func() {
 		for {
@@ -35,12 +35,24 @@ func StartBalanceDumper(ethService *eth.Ethereum, filePath string) {
 		defer ticker.Stop()
 
 		// Perform dump immediately on startup
-		dumpBalances(ethService, filePath)
+		dumpWithTimestamp(ethService, filePath)
 
 		for range ticker.C {
-			dumpBalances(ethService, filePath)
+			dumpWithTimestamp(ethService, filePath)
 		}
 	}()
+}
+
+func dumpWithTimestamp(ethService *eth.Ethereum, filePath string) {
+	dir := filepath.Dir(filePath)
+	base := filepath.Base(filePath)
+	ext := filepath.Ext(base)
+	name := strings.TrimSuffix(base, ext)
+
+	ts := time.Now().UTC().Format("20060102-150405")
+	out := filepath.Join(dir, fmt.Sprintf("%s-%s%s", name, ts, ext))
+
+	dumpBalances(ethService, out)
 }
 
 // dumpBalances gets the current state of the chain and stores non-zero balances.
