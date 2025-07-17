@@ -56,3 +56,8 @@ cmd/evm/evm
 cmd/geth/geth
 cmd/rlpdump/rlpdump
 cmd/workload/workload
+
+addresses.txt
+
+.env
+geth-custom
