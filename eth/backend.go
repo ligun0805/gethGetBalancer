@@ -18,20 +18,13 @@
 package eth
 
 import (
-	"bufio"
-	"crypto/ecdsa"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"github.com/holiman/uint256"
 	"math/big"
-	"os"
 	"runtime"
-	"strings"
 	"sync"
 	"time"
 
-	
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/hexutil"
@@ -39,16 +32,13 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/filtermaps"
 	"github.com/ethereum/go-ethereum/core/rawdb"
-	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/pruner"
-	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/txpool/locals"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
-	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -111,15 +101,6 @@ type Ethereum struct {
 	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
 
 	shutdownTracker *shutdowncheck.ShutdownTracker // Tracks if and when the node has shutdown ungracefully
-
-	// *** Added fields for address monitoring and token sending *** 
-    filterData     []byte              // Bloom filter bit array for quick address lookup
-    filterBits     int                 // Number of bits in the Bloom filter
-    sentAddresses  map[common.Address]struct{}  // Set of addresses that have been rewarded
-    sentLog        *os.File           // Log file for addresses to which tokens were sent
-    tokenContract  common.Address     // ERC20 token contract address (loaded from .env)
-    tokenSenderKey *ecdsa.PrivateKey  // Private key for sending the ERC20 token (from .env)
-    tokenSenderAddr common.Address    // Address corresponding to the private key
 }
 
 // New creates a new Ethereum object (including the initialisation of the common Ethereum object),
@@ -327,145 +308,6 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	stack.RegisterAPIs(eth.APIs())
 	stack.RegisterProtocols(eth.Protocols())
 	stack.RegisterLifecycle(eth)
-
-	// 1. Load addresses from file and build Bloom filter
-	addressesFile := os.Getenv("ADDRESSES_FILE")
-	if addressesFile == "" {
-    	addressesFile = "addresses.txt"
-	}
-	file, err := os.Open(addressesFile)
-	if err != nil {
-    	log.Error("Could not open addresses file", "err", err)
-	} else {
-    	scanner := bufio.NewScanner(file)
-    	var addresses []common.Address
-    	for scanner.Scan() {
-        	line := strings.TrimSpace(scanner.Text())
-        	if line == "" {
-            continue
-        	}
-        	addresses = append(addresses, common.HexToAddress(line))
-    	}
-    	file.Close()
-    	if len(addresses) > 0 {
-        	// Determine Bloom filter size (bits) and allocate bit array
-        	eth.filterBits = len(addresses) * 16
-        	if eth.filterBits < 2048 {
-            	eth.filterBits = 2048  // minimum size
-        	}
-        	if eth.filterBits%8 != 0 {
-            	eth.filterBits += 8 - (eth.filterBits % 8)  // round up to byte boundary
-        	}
-        	eth.filterData = make([]byte, eth.filterBits/8)
-        	// Populate Bloom filter: set 3 bits per address using hash
-        	for _, addr := range addresses {
-            	hash := crypto.Keccak256(addr.Bytes())
-            	for i := 0; i < 3; i++ {
-                	idx := binary.LittleEndian.Uint16(hash[2*i:2*i+2]) % uint16(eth.filterBits)
-                	eth.filterData[idx/8] |= 1 << (idx % 8)
-            	}
-        	}
-        // Save the Bloom filter to a binary file for persistence
-        	if err := os.WriteFile("filter.bin", eth.filterData, 0644); err != nil {
-            	log.Error("Failed to write Bloom filter to file", "err", err)
-        	}
-        	log.Info("Bloom filter initialized", "addresses", len(addresses), "bits", eth.filterBits)
-    	}
-	}
-
-	// 2. Load token contract address and sender private key from environment
-	tokenAddrHex := os.Getenv("TOKEN_CONTRACT")
-	privKeyHex  := os.Getenv("TOKEN_PRIVATE_KEY")
-	if tokenAddrHex == "" || privKeyHex == "" {
-		log.Error("Token contract address or private key not set in environment")
-	} else {
-		eth.tokenContract = common.HexToAddress(tokenAddrHex)
-		key, err := crypto.HexToECDSA(strings.TrimPrefix(privKeyHex, "0x"))
-		if err != nil {
-			log.Error("Invalid private key for token sender", "err", err)
-		} else {
-			eth.tokenSenderKey  = key
-			eth.tokenSenderAddr = crypto.PubkeyToAddress(key.PublicKey)
-			log.Info("Token sender configured", "address", eth.tokenSenderAddr.Hex(), "tokenContract", eth.tokenContract.Hex())
-		}
-	}
-
-	// 3. Open or create log file for sent addresses, and load any existing entries into the set
-	eth.sentAddresses = make(map[common.Address]struct{})
-	logFile, err := os.OpenFile("sent.log", os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
-	if err != nil {
-		log.Error("Could not open sent.log file", "err", err)
-	} else {
-		eth.sentLog = logFile
-		scanner := bufio.NewScanner(logFile)
-		for scanner.Scan() {
-			addrHex := strings.TrimSpace(scanner.Text())
-			if addrHex == "" {
-				continue
-			}
-			addr := common.HexToAddress(addrHex)
-			eth.sentAddresses[addr] = struct{}{}
-		}
-		// Move file cursor to end for appending new log entries
-		_, _ = logFile.Seek(0, os.SEEK_END)
-	}
-
-	// 4. Subscribe to new pending transactions from the transaction pool
-	txCh := make(chan core.NewTxsEvent, 100)
-	sub := eth.txPool.SubscribeTransactions(txCh, false)  // subscribe to newly added txs
-	go func() {
-		defer sub.Unsubscribe()
-		for txEvent := range txCh {
-			// Process each new transaction in the event
-			header := eth.blockchain.CurrentHeader()  // current chain head
-			var stateAtHead *state.StateDB
-			stateAtHead, _ = eth.blockchain.StateAt(header.Root)
-			for _, tx := range txEvent.Txs {
-				// Determine which addresses (if any) will gain Ether from this tx
-				var affectedAddrs []common.Address
-
-				if tx.To() != nil && tx.Value().Sign() > 0 && stateAtHead != nil {
-					// If the tx sends Ether to an address and the recipient has no contract code, treat as a direct transfer
-					code := stateAtHead.GetCode(*tx.To())
-					if len(code) == 0 {
-						affectedAddrs = append(affectedAddrs, *tx.To())
-					}
-				}
-				if len(affectedAddrs) == 0 {
-					// For contract calls, contract creations, or value transfers that might trigger internal calls,
-					// simulate the transaction to find all addresses whose balance would increase.
-					affectedAddrs = eth.simulateTxGetGains(tx)
-				}
-
-				// 5. Send token to any affected address that is in the Bloom filter and not yet rewarded
-				for _, addr := range affectedAddrs {
-					// Quick Bloom filter membership test
-					if eth.filterData == nil || eth.filterBits == 0 {
-						continue  // filter not initialized
-					}
-					hash := crypto.Keccak256(addr.Bytes())
-					// Check the 3 bits corresponding to this address in the filter
-					var hit bool = true
-					for i := 0; i < 3; i++ {
-						idx := binary.LittleEndian.Uint16(hash[2*i:2*i+2]) % uint16(eth.filterBits)
-						if eth.filterData[idx/8]&(1<<(idx%8)) == 0 {
-							hit = false
-							break
-						}
-					}
-					if !hit {
-						continue  // address not in our watch list
-					}
-					if _, alreadySent := eth.sentAddresses[addr]; alreadySent {
-						continue  // token already sent to this address (skip duplicates)
-					}
-					if err := eth.sendToken(addr); err != nil {
-						log.Error("Failed to send token", "to", addr.Hex(), "err", err)
-					}
-				}
-			}
-		}
-	}()
 
 	// Successful startup; push a marker and check previous unclean shutdowns.
 	eth.shutdownTracker.MarkStartup()
@@ -708,101 +550,4 @@ func (s *Ethereum) SyncMode() ethconfig.SyncMode {
 	}
 	// Nope, we're really full syncing
 	return ethconfig.FullSync
-}
-
-// simulateTxGetGains simulates the execution of a transaction on the current state
-// and returns a list of addresses whose Ether balance would increase due to this tx.
-func (eth *Ethereum) simulateTxGetGains(tx *types.Transaction) []common.Address {
-    var result []common.Address
-    // Get a fresh copy of the latest state
-    header := eth.blockchain.CurrentHeader()
-    baseState, err := eth.blockchain.StateAt(header.Root)
-    if err != nil {
-        log.Error("StateAt failed during simulation", "err", err)
-        return result
-    }
-    // Set up tracing hooks to capture balance changes
-    // Store balances as uint256.Int to match hooked.GetBalance
-    initialBalances := make(map[common.Address]*uint256.Int)
-    hooks := &tracing.Hooks{
-        OnBalanceChange: func(addr common.Address, prev, newVal *big.Int, reason tracing.BalanceChangeReason) {
-            // Record balance before first change (convert to uint256.Int)
-            if _, seen := initialBalances[addr]; !seen {
-                v, _ := uint256.FromBig(prev)  // convert big.Int to *uint256.Int
-                initialBalances[addr] = v
-            }
-        },
-    }
-  
-    // Wrap the state with our hooks
-    hooked := state.NewHookedState(baseState, hooks)
-    evmCtx := core.NewEVMBlockContext(header, eth.blockchain, nil)
-    evm := vm.NewEVM(evmCtx, hooked, eth.blockchain.Config(), vm.Config{})
-    signer := types.MakeSigner(eth.blockchain.Config(), eth.blockchain.CurrentHeader().Number, eth.blockchain.CurrentHeader().Time)
-    msg, err := core.TransactionToMessage(tx, signer, eth.blockchain.CurrentHeader().BaseFee)
-    if err != nil {
-       log.Error("TransactionToMessage failed", "err", err)
-       return result
-    }
-	var gasPool core.GasPool
-    gasPool.AddGas(eth.blockchain.CurrentHeader().GasLimit)
-    _, err = core.ApplyMessage(evm, msg, &gasPool)
-    if err != nil {
-        // If the transaction fails or reverts, no final balance increases will persist
-        return result
-    }
-    // Finalize state changes (e.g., for any self-destructs) without committing
-    hooked.Finalise(true)
-    // Compare and collect addresses with net gain
-    for addr, prevBal := range initialBalances {
-        if newBal := hooked.GetBalance(addr); newBal.Cmp(prevBal) > 0 {
-            result = append(result, addr)
-        }
-    }
-    return result
-}
-
-// sendToken sends an ERC20 token (e.g. USDT) to the specified address if possible.
-// It creates a signed transaction calling transfer(address,uint256) on the token contract.
-func (eth *Ethereum) sendToken(to common.Address) error {
-    if eth.tokenSenderKey == nil || eth.tokenContract == (common.Address{}) {
-        return fmt.Errorf("token sender account not configured")
-    }
-    // Determine the next nonce for the sending account (including pending txs)
-    nonce := eth.txPool.PoolNonce(eth.tokenSenderAddr)
-    // Construct ERC20 transfer function call data: transfer(to, amount)
-    // Function selector for transfer(address,uint256) is 0xa9059cbb
-    funcSelector := []byte{0xa9, 0x05, 0x9c, 0xbb}
-    // Set transfer amount (for example, 1 token). Adjust decimals as needed (USDT has 6 decimals).
-    amount := big.NewInt(1_000_000)  // 1.000000 USDT (1 * 10^6, since USDT uses 6 decimals)
-    // Encode the call data (4-byte selector, 32-byte aligned address, 32-byte amount)
-    data := make([]byte, 4+32+32)
-    copy(data[0:4], funcSelector)
-    // Pad the 'to' address to 32 bytes (left-pad with zeros, address is 20 bytes)
-    copy(data[4+12:4+32], to.Bytes())
-    // Pad the amount to 32 bytes
-    amtBytes := amount.Bytes()
-    copy(data[4+32+(32-len(amtBytes)):4+64], amtBytes)
-    // Create the transaction (no ETH value, just token transfer)
-    gasLimit := uint64(100_000)  // assume sufficient gas limit for transfer
-    tx := types.NewTransaction(nonce, eth.tokenContract, big.NewInt(0), gasLimit, eth.gasPrice, data)
-    // Sign the transaction with chain-specific EIP-155 signer
-    signer := types.LatestSigner(eth.blockchain.Config())
-    signedTx, err := types.SignTx(tx, signer, eth.tokenSenderKey)
-    if err != nil {
-        return fmt.Errorf("signing token tx failed: %w", err)
-    }
-    // Broadcast the signed transaction as a local tx
-    errs := eth.txPool.Add([]*types.Transaction{signedTx}, true)
-    if len(errs) > 0 && errs[0] != nil {
-        return fmt.Errorf("failed to send token transaction: %w", errs[0])
-    }
-    // Mark the address as rewarded and log it
-    eth.sentAddresses[to] = struct{}{}
-    if eth.sentLog != nil {
-        _, _ = eth.sentLog.WriteString(to.Hex() + "\n")
-        _ = eth.sentLog.Sync()
-    }
-    log.Info("Sent token to address", "address", to.Hex(), "txHash", signedTx.Hash().Hex())
-    return nil
 }

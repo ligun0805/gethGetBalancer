@@ -362,13 +362,12 @@ func publishBlock(
 	queueName string,
 	blockNum uint64,
 ) error {
-	// 1) Get the block
 	blk, err := rpcClient.BlockByNumber(ctx, new(big.Int).SetUint64(blockNum))
 	if err != nil {
 		return fmt.Errorf("fetch block %d: %w", blockNum, err)
 	}
 
-	// 2) Collect unique addresses from tx and logs
+	// Collect all addresses
 	addrSet := make(map[common.Address]struct{})
 	for _, tx := range blk.Transactions() {
 		if from, err := types.Sender(signer, tx); err == nil {
@@ -386,11 +385,7 @@ func publishBlock(
 		}
 	}
 
-	// 3) Form the message body
 	hashBytes := blk.Hash().Bytes()
-	body := make([]byte, 0, 32+len(addrSet)*(20+1+32))
-	body = append(body, hashBytes...)
-
 	for addr := range addrSet {
 		bal, err := rpcClient.BalanceAt(ctx, addr, new(big.Int).SetUint64(blockNum))
 		if err != nil {
@@ -400,40 +395,34 @@ func publishBlock(
 		if bal.Sign() <= 0 {
 			continue
 		}
+
 		balB := bal.Bytes()
 		if len(balB) > 255 {
 			return fmt.Errorf("balance too large for %s at block %d", addr.Hex(), blockNum)
 		}
 
-		// add [20B address][1B len][N B balance]
-		entry := make([]byte, 20+1+len(balB))
-		copy(entry[0:20], addr.Bytes())
-		entry[20] = byte(len(balB))
-		copy(entry[21:], balB)
-		body = append(body, entry...)
+		pkt := make([]byte, 32+20+1+len(balB))
+		copy(pkt[0:32], hashBytes)
+		copy(pkt[32:52], addr.Bytes())
+		pkt[52] = byte(len(balB))
+		copy(pkt[53:], balB)
+
+		// 1) Log in human-readable form
+		log.Info("Publishing balance",
+			"block", blockNum,
+			"txHash", blk.Hash().Hex(),
+			"address", addr.Hex(),
+			"balance", bal.String(),
+		)
+		// 2) If necessary - log of the full telegram (hex)
+		log.Info("Raw packet", "data", hex.EncodeToString(pkt))
+
+		if err := ch.Publish("", queueName, false, false, amqp.Publishing{
+			ContentType: "application/octet-stream",
+			Body:        pkt,
+		}); err != nil {
+			return fmt.Errorf("publish block %d addr %s: %w", blockNum, addr.Hex(), err)
+		}
 	}
-
-	// 4) If there is no other data except the hash, we do not publish anything
-	if len(body) == 32 {
-		log.Info("No non-zero balances in block", "block", blockNum, "hash", blk.Hash().Hex())
-		return nil
-	}
-
-	// 5) Logging information about the message
-	log.Info("Publishing block balances",
-		"block", blockNum,
-		"hash", blk.Hash().Hex(),
-		"size_bytes", len(body),
-	)
-	log.Info("Message payload (hex)", "data", hex.EncodeToString(body))
-
-	// 6) Publish in one message
-	if err := ch.Publish("", queueName, false, false, amqp.Publishing{
-		ContentType: "application/octet-stream",
-		Body:        body,
-	}); err != nil {
-		return fmt.Errorf("publish block %d: %w", blockNum, err)
-	}
-
 	return nil
 }
