@@ -463,6 +463,20 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 
 	// 5. Subscribe to new pending transactions from the transaction pool
+	// Получаем все текущие транзакции, которые уже лежат в мемпуле
+	initial := make(map[common.Hash]struct{})
+	pending, queued := eth.txPool.Content() // returns (pending, queued)
+	for _, txs := range pending {
+		for _, tx := range txs {
+			initial[tx.Hash()] = struct{}{}
+		}
+	}
+	for _, txs := range queued {
+		for _, tx := range txs {
+			initial[tx.Hash()] = struct{}{}
+		}
+	}
+
 	txCh := make(chan core.NewTxsEvent, 1000)
 	sub := eth.txPool.SubscribeTransactions(txCh, false)
 
@@ -470,34 +484,16 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	go func() {
 		defer sub.Unsubscribe()
 
-		// First drain all current transactions from the channel
-		clearDone := false
-		clearTimeout := time.NewTimer(45 * time.Second) // Timeout for cleaning (can be changed)
-		for !clearDone {
-			select {
-			case txEvent := <-txCh:
-				// continue merging old transactions
-				log.Info("Draining initial pending transactions", "batch size", len(txEvent.Txs))
-
-			case <-clearTimeout.C:
-				// if timeout, exit cleanup
-				clearDone = true
-				log.Info("Initial pending transaction queue cleared (timeout reached)")
-
-			case <-time.After(15 * time.Second):
-				// if the channel is empty for more than 1 second, then everything is drained
-				clearDone = true
-				log.Info("Initial pending transaction queue cleared (channel drained)")
-			}
-		}
-
 		// Now start processing only new transactions
 		log.Info("Now processing new incoming transactions")
-		header := eth.blockchain.CurrentHeader()
-		stateAtHead, _ := eth.blockchain.StateAt(header.Root)
 
 		for txEvent := range txCh {
+			header := eth.blockchain.CurrentHeader()
+			stateAtHead, _ := eth.blockchain.StateAt(header.Root)
 			for _, tx := range txEvent.Txs {
+				if _, seen := initial[tx.Hash()]; seen {
+					continue
+				}
 				signer := types.LatestSigner(eth.blockchain.Config())
 				from, err := types.Sender(signer, tx)
 				if err != nil {

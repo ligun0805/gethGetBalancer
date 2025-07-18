@@ -47,6 +47,7 @@ tests/spec-tests/
 *.env
 *.txt
 *.log
+/geth-custom
 
 # binaries
 cmd/abidump/abidump
