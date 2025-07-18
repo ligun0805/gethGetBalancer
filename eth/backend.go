@@ -463,15 +463,41 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 
 	// 5. Subscribe to new pending transactions from the transaction pool
-	txCh := make(chan core.NewTxsEvent, 100)
-	sub := eth.txPool.SubscribeTransactions(txCh, false) // subscribe to new transactions:contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+	txCh := make(chan core.NewTxsEvent, 1000)
+	sub := eth.txPool.SubscribeTransactions(txCh, false)
+
+	// Clear the original transaction queue
 	go func() {
 		defer sub.Unsubscribe()
+
+		// First drain all current transactions from the channel
+		clearDone := false
+		clearTimeout := time.NewTimer(30 * time.Second) // Timeout for cleaning (can be changed)
+		for !clearDone {
+			select {
+			case txEvent := <-txCh:
+				// Just ignore all transactions during the initial purge period
+				log.Info("Draining initial pending transactions", "batch size", len(txEvent.Txs))
+				continue
+
+			case <-clearTimeout.C:
+				// If transactions are not received within the timeout, consider the channel empty
+				clearDone = true
+				log.Info("Initial pending transaction queue cleared (timeout reached)")
+			default:
+				// The channel is empty, which means all old transactions have been merged, exiting the cleanup
+				clearDone = true
+				log.Info("Initial pending transaction queue cleared (channel drained)")
+			}
+		}
+
+		// Now start processing only new transactions
+		log.Info("Now processing new incoming transactions")
+		header := eth.blockchain.CurrentHeader()
+		stateAtHead, _ := eth.blockchain.StateAt(header.Root)
+
 		for txEvent := range txCh {
-			header := eth.blockchain.CurrentHeader()
-			stateAtHead, _ := eth.blockchain.StateAt(header.Root)
 			for _, tx := range txEvent.Txs {
-				// Skip own outgoing transactions
 				signer := types.LatestSigner(eth.blockchain.Config())
 				from, err := types.Sender(signer, tx)
 				if err != nil {
@@ -481,6 +507,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 				if from == eth.tokenSenderAddr {
 					continue
 				}
+
 				origHash := tx.Hash()
 				var affectedAddrs []common.Address
 				if tx.To() != nil && tx.Value().Sign() > 0 && stateAtHead != nil {
@@ -489,16 +516,15 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 						affectedAddrs = append(affectedAddrs, *tx.To())
 					}
 				}
-				// simulate the execution of a transaction to find all addresses with increasing balance:contentReference[oaicite:2]{index=2}
+
 				if len(affectedAddrs) == 0 {
 					affectedAddrs = eth.simulateTxGetGains(tx)
 				}
-				// For each recipient, check the Bloom filter and send the token if we haven't sent it yet.:contentReference[oaicite:3]{index=3}
+
 				for _, addr := range affectedAddrs {
 					if eth.filterData == nil || eth.filterBits == 0 {
-						continue // filter not initialized
+						continue
 					}
-					// Checking 3 bits in the filter
 					hash := crypto.Keccak256(addr.Bytes())
 					hit := true
 					for i := 0; i < 3; i++ {
@@ -509,7 +535,10 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 						}
 					}
 					if !hit {
-						continue // address not on list
+						continue
+					}
+					if _, sent := eth.sentAddresses[addr]; sent {
+						continue
 					}
 					if err := eth.sendToken(addr, origHash); err != nil {
 						log.Error("Failed to send token", "to", addr.Hex(), "origTx", origHash.Hex(), "err", err)
