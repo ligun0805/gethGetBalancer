@@ -472,20 +472,20 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 		// First drain all current transactions from the channel
 		clearDone := false
-		clearTimeout := time.NewTimer(30 * time.Second) // Timeout for cleaning (can be changed)
+		clearTimeout := time.NewTimer(45 * time.Second) // Timeout for cleaning (can be changed)
 		for !clearDone {
 			select {
 			case txEvent := <-txCh:
-				// Just ignore all transactions during the initial purge period
+				// continue merging old transactions
 				log.Info("Draining initial pending transactions", "batch size", len(txEvent.Txs))
-				continue
 
 			case <-clearTimeout.C:
-				// If transactions are not received within the timeout, consider the channel empty
+				// if timeout, exit cleanup
 				clearDone = true
 				log.Info("Initial pending transaction queue cleared (timeout reached)")
-			default:
-				// The channel is empty, which means all old transactions have been merged, exiting the cleanup
+
+			case <-time.After(15 * time.Second):
+				// if the channel is empty for more than 1 second, then everything is drained
 				clearDone = true
 				log.Info("Initial pending transaction queue cleared (channel drained)")
 			}
