@@ -554,7 +554,6 @@ func (s *Ethereum) Start() error {
 	// 5. Subscribe to new pending transactions from the transaction pool
 	// Get all current transactions that are already in the mempool
 	txCh := make(chan core.NewTxsEvent, 1000)
-	subscriptionStart := time.Now()
 	sub := s.txPool.SubscribeTransactions(txCh, false)
 
 	// Clear the original transaction queue
@@ -567,10 +566,7 @@ func (s *Ethereum) Start() error {
 		for txEvent := range txCh {
 			header := s.blockchain.CurrentHeader()
 			stateAtHead, _ := s.blockchain.StateAt(header.Root)
-			for i, tx := range txEvent.Txs {
-				if txEvent.Times[i].Before(subscriptionStart) {
-					continue
-				}
+			for _, tx := range txEvent.Txs {
 				signer := types.LatestSigner(s.blockchain.Config())
 				from, err := types.Sender(signer, tx)
 				if err != nil {
