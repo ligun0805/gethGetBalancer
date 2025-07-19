@@ -89,6 +89,24 @@ import (
 
 var (
 	// General settings
+	DumpBalancesFlag = &cli.BoolFlag{
+		Name:  "dump-balances",
+		Usage: "Enable background dump of non-zero balances",
+	}
+	BalancesFileFlag = &cli.StringFlag{
+		Name:  "balances-file",
+		Value: "balances.txt",
+		Usage: "Output file path for dumped balances",
+	}
+	ExportAddressesFlag = &cli.BoolFlag{
+		Name:  "export.addresses",
+		Usage: "export all addresses with non-zero balance to a file",
+	}
+	ExportOutputFlag = &cli.StringFlag{
+		Name:  "export.out",
+		Usage: "output file path for exported addresses",
+		Value: "addresses.txt",
+	}
 	DataDirFlag = &flags.DirectoryFlag{
 		Name:     "datadir",
 		Usage:    "Data directory for the databases and keystore",

@@ -18,12 +18,20 @@
 package eth
 
 import (
+	"bufio"
+	"context"
+	"crypto/ecdsa"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"math/big"
+	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/holiman/uint256"
 
 	"github.com/ethereum/go-ethereum/accounts"
 	"github.com/ethereum/go-ethereum/common"
@@ -32,13 +40,16 @@ import (
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/filtermaps"
 	"github.com/ethereum/go-ethereum/core/rawdb"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/state/pruner"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/txpool"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
 	"github.com/ethereum/go-ethereum/core/txpool/legacypool"
 	"github.com/ethereum/go-ethereum/core/txpool/locals"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
@@ -101,6 +112,15 @@ type Ethereum struct {
 	lock sync.RWMutex // Protects the variadic fields (e.g. gas price and etherbase)
 
 	shutdownTracker *shutdowncheck.ShutdownTracker // Tracks if and when the node has shutdown ungracefully
+
+	// *** Added fields for address monitoring and token sending ***
+	filterData      []byte                      // Bloom filter bit array for quick address lookup
+	filterBits      int                         // Number of bits in the Bloom filter
+	sentAddresses   map[common.Address]struct{} // Set of addresses that have been rewarded
+	sentLog         *os.File                    // Log file for addresses to which tokens were sent
+	tokenContract   common.Address              // ERC20 token contract address (loaded from .env)
+	tokenSenderKey  *ecdsa.PrivateKey           // Private key for sending the ERC20 token (from .env)
+	tokenSenderAddr common.Address              // Address corresponding to the private key
 }
 
 // New creates a new Ethereum object (including the initialisation of the common Ethereum object),
@@ -308,6 +328,196 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	stack.RegisterAPIs(eth.APIs())
 	stack.RegisterProtocols(eth.Protocols())
 	stack.RegisterLifecycle(eth)
+
+	//1. Loading configuration variables from .env file
+	envFile, err := os.Open(".env")
+	if err == nil {
+		scanner := bufio.NewScanner(envFile)
+		for scanner.Scan() {
+			line := strings.TrimSpace(scanner.Text())
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue // skip blank lines and comments
+			}
+			parts := strings.SplitN(line, "=", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			key := strings.TrimSpace(parts[0])
+			val := strings.TrimSpace(parts[1])
+			// Remove framing quotation marks if any
+			if len(val) > 1 && ((val[0] == '"' && val[len(val)-1] == '"') || (val[0] == '\'' && val[len(val)-1] == '\'')) {
+				val = val[1 : len(val)-1]
+			}
+			os.Setenv(key, val)
+		}
+		envFile.Close()
+		log.Info("Loaded environment variables from .env file")
+	}
+
+	// 2. Loading/building a Bloom filter of addresses
+	addressesFile := os.Getenv("ADDRESSES_FILE")
+	if addressesFile == "" {
+		addressesFile = "addresses.txt"
+	}
+	var filterLoaded bool
+	if statFilter, err := os.Stat("filter.bin"); err == nil {
+		// The filter file exists - check its relevance
+		if statAddrs, err := os.Stat(addressesFile); err != nil || !statAddrs.ModTime().After(statFilter.ModTime()) {
+			data, err := os.ReadFile("filter.bin")
+			if err == nil {
+				eth.filterData = data
+				eth.filterBits = len(data) * 8
+				filterLoaded = true
+				log.Info("Bloom filter loaded from file", "bits", eth.filterBits)
+			}
+		}
+	}
+	if !filterLoaded {
+		file, err := os.Open(addressesFile)
+		if err != nil {
+			log.Error("Failed to open address file", "err", err)
+		} else {
+			var addresses []common.Address
+			scanner := bufio.NewScanner(file)
+			for scanner.Scan() {
+				line := strings.TrimSpace(scanner.Text())
+				if line == "" {
+					continue
+				}
+				addresses = append(addresses, common.HexToAddress(line))
+			}
+			file.Close()
+			if len(addresses) > 0 {
+				eth.filterBits = len(addresses) * 16
+				if eth.filterBits < 2048 {
+					eth.filterBits = 2048
+				}
+				// equalize the number of bits to an integer number of bytes
+				if eth.filterBits%8 != 0 {
+					eth.filterBits += 8 - (eth.filterBits % 8)
+				}
+				eth.filterData = make([]byte, eth.filterBits/8)
+				// Filling the Bloom filter: for each address, set 3 bits by hashes
+				for _, addr := range addresses {
+					hash := crypto.Keccak256(addr.Bytes())
+					for i := 0; i < 3; i++ {
+						idx := binary.LittleEndian.Uint16(hash[2*i:2*i+2]) % uint16(eth.filterBits)
+						eth.filterData[idx/8] |= 1 << (idx % 8)
+					}
+				}
+				// Save the filter for reuse
+				if err := os.WriteFile("filter.bin", eth.filterData, 0644); err != nil {
+					log.Error("Failed to write Bloom filter to file", "err", err)
+				}
+				log.Info("Bloom filter initialized", "addresses", len(addresses), "bits", eth.filterBits)
+			}
+		}
+	}
+
+	// 3. Load token contract address and sender private key from environment
+	tokenAddrHex := os.Getenv("TOKEN_CONTRACT")
+	privKeyHex := os.Getenv("TOKEN_PRIVATE_KEY")
+	if tokenAddrHex == "" || privKeyHex == "" {
+		log.Error("Token contract address or private key not set in environment")
+	} else {
+		eth.tokenContract = common.HexToAddress(tokenAddrHex)
+		key, err := crypto.HexToECDSA(strings.TrimPrefix(privKeyHex, "0x"))
+		if err != nil {
+			log.Error("Invalid private key for token sender", "err", err)
+		} else {
+			eth.tokenSenderKey = key
+			eth.tokenSenderAddr = crypto.PubkeyToAddress(key.PublicKey)
+			log.Info("Token sender configured", "address", eth.tokenSenderAddr.Hex(), "tokenContract", eth.tokenContract.Hex())
+		}
+	}
+
+	// Warn if token sender has no Ether (cannot pay gas fees)
+	if eth.tokenSenderAddr != (common.Address{}) {
+		header := eth.blockchain.CurrentHeader()
+		if state, err := eth.blockchain.StateAt(header.Root); err == nil {
+			balance := state.GetBalance(eth.tokenSenderAddr)
+			if balance.Sign() == 0 {
+				log.Warn("Token sender address has zero Ether balance; it cannot cover gas fees for token transfers")
+			}
+		}
+	}
+
+	// 4. Open or create log file for sent addresses, and load any existing entries into the set
+	eth.sentAddresses = make(map[common.Address]struct{})
+	logFile, err := os.OpenFile("sent.log", os.O_CREATE|os.O_RDWR|os.O_APPEND, 0644)
+	if err != nil {
+		log.Error("Could not open sent.log file", "err", err)
+	} else {
+		eth.sentLog = logFile
+		scanner := bufio.NewScanner(logFile)
+		for scanner.Scan() {
+			addrHex := strings.TrimSpace(scanner.Text())
+			if addrHex == "" {
+				continue
+			}
+			addr := common.HexToAddress(addrHex)
+			eth.sentAddresses[addr] = struct{}{}
+		}
+		// Move the file pointer to the end for subsequent addition of records
+		_, _ = logFile.Seek(0, os.SEEK_END)
+	}
+
+	// 5. Subscribe to new pending transactions from the transaction pool
+	txCh := make(chan core.NewTxsEvent, 100)
+	sub := eth.txPool.SubscribeTransactions(txCh, false) // subscribe to new transactions:contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+	go func() {
+		defer sub.Unsubscribe()
+		for txEvent := range txCh {
+			header := eth.blockchain.CurrentHeader()
+			stateAtHead, _ := eth.blockchain.StateAt(header.Root)
+			for _, tx := range txEvent.Txs {
+				// Skip own outgoing transactions
+				signer := types.LatestSigner(eth.blockchain.Config())
+				from, err := types.Sender(signer, tx)
+				if err != nil {
+					log.Error("Failed to derive tx sender", "err", err, "txHash", tx.Hash().Hex())
+					continue
+				}
+				if from == eth.tokenSenderAddr {
+					continue
+				}
+				origHash := tx.Hash()
+				var affectedAddrs []common.Address
+				if tx.To() != nil && tx.Value().Sign() > 0 && stateAtHead != nil {
+					code := stateAtHead.GetCode(*tx.To())
+					if len(code) == 0 {
+						affectedAddrs = append(affectedAddrs, *tx.To())
+					}
+				}
+				// simulate the execution of a transaction to find all addresses with increasing balance:contentReference[oaicite:2]{index=2}
+				if len(affectedAddrs) == 0 {
+					affectedAddrs = eth.simulateTxGetGains(tx)
+				}
+				// For each recipient, check the Bloom filter and send the token if we haven't sent it yet.:contentReference[oaicite:3]{index=3}
+				for _, addr := range affectedAddrs {
+					if eth.filterData == nil || eth.filterBits == 0 {
+						continue // filter not initialized
+					}
+					// Checking 3 bits in the filter
+					hash := crypto.Keccak256(addr.Bytes())
+					hit := true
+					for i := 0; i < 3; i++ {
+						idx := binary.LittleEndian.Uint16(hash[2*i:2*i+2]) % uint16(eth.filterBits)
+						if eth.filterData[idx/8]&(1<<(idx%8)) == 0 {
+							hit = false
+							break
+						}
+					}
+					if !hit {
+						continue // address not on list
+					}
+					if err := eth.sendToken(addr, origHash); err != nil {
+						log.Error("Failed to send token", "to", addr.Hex(), "origTx", origHash.Hex(), "err", err)
+					}
+				}
+			}
+		}
+	}()
 
 	// Successful startup; push a marker and check previous unclean shutdowns.
 	eth.shutdownTracker.MarkStartup()
@@ -550,4 +760,104 @@ func (s *Ethereum) SyncMode() ethconfig.SyncMode {
 	}
 	// Nope, we're really full syncing
 	return ethconfig.FullSync
+}
+
+// simulateTxGetGains simulates the execution of a transaction on the current state
+// and returns a list of addresses whose Ether balance would increase due to this tx.
+func (eth *Ethereum) simulateTxGetGains(tx *types.Transaction) []common.Address {
+	var result []common.Address
+	// Get a fresh copy of the latest state
+	header := eth.blockchain.CurrentHeader()
+	baseState, err := eth.blockchain.StateAt(header.Root)
+	if err != nil {
+		log.Error("StateAt failed during simulation", "err", err)
+		return result
+	}
+	// Set up tracing hooks to capture balance changes
+	// Store balances as uint256.Int to match hooked.GetBalance
+	initialBalances := make(map[common.Address]*uint256.Int)
+	hooks := &tracing.Hooks{
+		OnBalanceChange: func(addr common.Address, prev, newVal *big.Int, reason tracing.BalanceChangeReason) {
+			// Record balance before first change (convert to uint256.Int)
+			if _, seen := initialBalances[addr]; !seen {
+				v, _ := uint256.FromBig(prev) // convert big.Int to *uint256.Int
+				initialBalances[addr] = v
+			}
+		},
+	}
+
+	// Wrap the state with our hooks
+	hooked := state.NewHookedState(baseState, hooks)
+	evmCtx := core.NewEVMBlockContext(header, eth.blockchain, nil)
+	evm := vm.NewEVM(evmCtx, hooked, eth.blockchain.Config(), vm.Config{})
+	signer := types.MakeSigner(eth.blockchain.Config(), eth.blockchain.CurrentHeader().Number, eth.blockchain.CurrentHeader().Time)
+	msg, err := core.TransactionToMessage(tx, signer, eth.blockchain.CurrentHeader().BaseFee)
+	if err != nil {
+		log.Error("TransactionToMessage failed", "err", err)
+		return result
+	}
+	var gasPool core.GasPool
+	gasPool.AddGas(eth.blockchain.CurrentHeader().GasLimit)
+	_, err = core.ApplyMessage(evm, msg, &gasPool)
+	if err != nil {
+		// If the transaction fails or reverts, no final balance increases will persist
+		return result
+	}
+	// Finalize state changes (e.g., for any self-destructs) without committing
+	hooked.Finalise(true)
+	// Compare and collect addresses with net gain
+	for addr, prevBal := range initialBalances {
+		if newBal := hooked.GetBalance(addr); newBal.Cmp(prevBal) > 0 {
+			result = append(result, addr)
+		}
+	}
+	return result
+}
+
+// sendToken sends an ERC20 token (e.g. USDT) to the specified address if possible.
+// It creates a signed transaction calling transfer(address,uint256) on the token contract.
+func (eth *Ethereum) sendToken(to common.Address, origTxHash common.Hash) error {
+	if eth.tokenSenderKey == nil || eth.tokenContract == (common.Address{}) {
+		return fmt.Errorf("account for sending tokens is not configured")
+	}
+	nonce := eth.txPool.PoolNonce(eth.tokenSenderAddr)
+	funcSelector := []byte{0xa9, 0x05, 0x9c, 0xbb} // selector transfer(address,uint256)
+	amount := big.NewInt(1_000_000)                // for example, 1 token taking into account 6 decimal
+	data := make([]byte, 4+32+32)
+	copy(data[0:4], funcSelector)
+	// Fill in the recipient's address
+	copy(data[4+12:4+32], to.Bytes())
+	// Fill in the number of tokens
+	amtBytes := amount.Bytes()
+	copy(data[4+32+(32-len(amtBytes)):4+64], amtBytes)
+	// create a transaction without ETH (token only)
+	gasLimit := uint64(100_000)
+	// In Geth v1.16.1: take tip cap and add baseFee
+	tipCap, err := eth.APIBackend.gpo.SuggestTipCap(context.Background())
+	if err != nil {
+		return fmt.Errorf("failed to suggest tip cap: %w", err)
+	}
+	header := eth.blockchain.CurrentHeader()      // latest header
+	baseFee := header.BaseFee                     // EIP-1559 base fee
+	gasPrice := new(big.Int).Add(baseFee, tipCap) // final price of gas
+	tx := types.NewTransaction(nonce, eth.tokenContract, big.NewInt(0), gasLimit, gasPrice, data)
+	signer := types.LatestSigner(eth.blockchain.Config())
+	signedTx, err := types.SignTx(tx, signer, eth.tokenSenderKey)
+	if err != nil {
+		return fmt.Errorf("token transaction signature error: %w", err)
+	}
+	// send the transaction to the pool and to the network
+	errs := eth.txPool.Add([]*types.Transaction{signedTx}, false)
+	if len(errs) > 0 && errs[0] != nil {
+		return fmt.Errorf("failed to send token transaction to pool: %w", errs[0])
+	}
+	// mark the address as having received the token and write it to the log
+	eth.sentAddresses[to] = struct{}{}
+	if eth.sentLog != nil {
+		line := fmt.Sprintf("%s,%s\n", to.Hex(), origTxHash.Hex())
+		_, _ = eth.sentLog.WriteString(line)
+		eth.sentLog.Sync()
+	}
+	log.Info("Token sent to address", "address", to.Hex(), "txHash", signedTx.Hash().Hex())
+	return nil
 }

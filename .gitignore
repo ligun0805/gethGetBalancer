@@ -44,6 +44,10 @@ profile.cov
 
 tests/spec-tests/
 
+*.env
+*.txt
+*.log
+
 # binaries
 cmd/abidump/abidump
 cmd/abigen/abigen
