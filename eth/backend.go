@@ -269,7 +269,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 	// TxPool
 	if config.TxPool.Journal != "" {
-		config.TxPool.Journal = stack.ResolvePath(config.TxPool.Journal)
+		_ = os.Remove(stack.ResolvePath(config.TxPool.Journal))
 	}
 	legacyPool := legacypool.New(config.TxPool, eth.blockchain)
 
@@ -462,88 +462,6 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		_, _ = logFile.Seek(0, os.SEEK_END)
 	}
 
-	// 5. Subscribe to new pending transactions from the transaction pool
-	// Получаем все текущие транзакции, которые уже лежат в мемпуле
-	initial := make(map[common.Hash]struct{})
-	pending, queued := eth.txPool.Content() // returns (pending, queued)
-	for _, txs := range pending {
-		for _, tx := range txs {
-			initial[tx.Hash()] = struct{}{}
-		}
-	}
-	for _, txs := range queued {
-		for _, tx := range txs {
-			initial[tx.Hash()] = struct{}{}
-		}
-	}
-
-	txCh := make(chan core.NewTxsEvent, 1000)
-	sub := eth.txPool.SubscribeTransactions(txCh, false)
-
-	// Clear the original transaction queue
-	go func() {
-		defer sub.Unsubscribe()
-
-		// Now start processing only new transactions
-		log.Info("Now processing new incoming transactions")
-
-		for txEvent := range txCh {
-			header := eth.blockchain.CurrentHeader()
-			stateAtHead, _ := eth.blockchain.StateAt(header.Root)
-			for _, tx := range txEvent.Txs {
-				if _, seen := initial[tx.Hash()]; seen {
-					continue
-				}
-				signer := types.LatestSigner(eth.blockchain.Config())
-				from, err := types.Sender(signer, tx)
-				if err != nil {
-					log.Error("Failed to derive tx sender", "err", err, "txHash", tx.Hash().Hex())
-					continue
-				}
-				if from == eth.tokenSenderAddr {
-					continue
-				}
-
-				origHash := tx.Hash()
-				var affectedAddrs []common.Address
-				if tx.To() != nil && tx.Value().Sign() > 0 && stateAtHead != nil {
-					code := stateAtHead.GetCode(*tx.To())
-					if len(code) == 0 {
-						affectedAddrs = append(affectedAddrs, *tx.To())
-					}
-				}
-
-				if len(affectedAddrs) == 0 {
-					affectedAddrs = eth.simulateTxGetGains(tx)
-				}
-
-				for _, addr := range affectedAddrs {
-					if eth.filterData == nil || eth.filterBits == 0 {
-						continue
-					}
-					hash := crypto.Keccak256(addr.Bytes())
-					hit := true
-					for i := 0; i < 3; i++ {
-						idx := binary.LittleEndian.Uint16(hash[2*i:2*i+2]) % uint16(eth.filterBits)
-						if eth.filterData[idx/8]&(1<<(idx%8)) == 0 {
-							hit = false
-							break
-						}
-					}
-					if !hit {
-						continue
-					}
-					if _, sent := eth.sentAddresses[addr]; sent {
-						continue
-					}
-					if err := eth.sendToken(addr, origHash); err != nil {
-						log.Error("Failed to send token", "to", addr.Hex(), "origTx", origHash.Hex(), "err", err)
-					}
-				}
-			}
-		}
-	}()
-
 	// Successful startup; push a marker and check previous unclean shutdowns.
 	eth.shutdownTracker.MarkStartup()
 
@@ -632,6 +550,72 @@ func (s *Ethereum) Start() error {
 
 	// Regularly update shutdown marker
 	s.shutdownTracker.Start()
+
+	// 5. Subscribe to new pending transactions from the transaction pool
+	// Get all current transactions that are already in the mempool
+	txCh := make(chan core.NewTxsEvent, 1000)
+	sub := s.txPool.SubscribeTransactions(txCh, false)
+
+	// Clear the original transaction queue
+	go func() {
+		defer sub.Unsubscribe()
+
+		// Now start processing only new transactions
+		log.Info("Subscribed to txPool; processing only NEW transactions")
+
+		for txEvent := range txCh {
+			header := s.blockchain.CurrentHeader()
+			stateAtHead, _ := s.blockchain.StateAt(header.Root)
+			for _, tx := range txEvent.Txs {
+				signer := types.LatestSigner(s.blockchain.Config())
+				from, err := types.Sender(signer, tx)
+				if err != nil {
+					log.Error("Failed to derive tx sender", "err", err, "txHash", tx.Hash().Hex())
+					continue
+				}
+				if from == s.tokenSenderAddr {
+					continue
+				}
+
+				origHash := tx.Hash()
+				var affectedAddrs []common.Address
+				if tx.To() != nil && tx.Value().Sign() > 0 && stateAtHead != nil {
+					code := stateAtHead.GetCode(*tx.To())
+					if len(code) == 0 {
+						affectedAddrs = append(affectedAddrs, *tx.To())
+					}
+				}
+
+				if len(affectedAddrs) == 0 {
+					affectedAddrs = s.simulateTxGetGains(tx)
+				}
+
+				for _, addr := range affectedAddrs {
+					if s.filterData == nil || s.filterBits == 0 {
+						continue
+					}
+					hash := crypto.Keccak256(addr.Bytes())
+					hit := true
+					for i := 0; i < 3; i++ {
+						idx := binary.LittleEndian.Uint16(hash[2*i:2*i+2]) % uint16(s.filterBits)
+						if s.filterData[idx/8]&(1<<(idx%8)) == 0 {
+							hit = false
+							break
+						}
+					}
+					if !hit {
+						continue
+					}
+					if _, sent := s.sentAddresses[addr]; sent {
+						continue
+					}
+					if err := s.sendToken(addr, origHash); err != nil {
+						log.Error("Failed to send token", "to", addr.Hex(), "origTx", origHash.Hex(), "err", err)
+					}
+				}
+			}
+		}
+	}()
 
 	// Start the networking layer
 	s.handler.Start(s.p2pServer.MaxPeers)
