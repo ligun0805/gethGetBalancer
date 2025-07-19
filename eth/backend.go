@@ -52,6 +52,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
+	"github.com/ethereum/go-ethereum/eth/filters"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth"
 	"github.com/ethereum/go-ethereum/eth/protocols/snap"
@@ -463,14 +464,16 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	}
 
 	// 5. Subscribe to new pending transactions from the transaction pool
-	txCh := make(chan core.NewTxsEvent, 100)
-	sub := eth.txPool.SubscribeTransactions(txCh, false) // subscribe to new transactions:contentReference[oaicite:0]{index=0}:contentReference[oaicite:1]{index=1}
+	filterSys := filters.NewFilterSystem(eth.APIBackend, filters.Config{})
+	fs := filters.NewEventSystem(filterSys)
+	pendingCh := make(chan []*types.Transaction, 100)
+	sub := fs.SubscribePendingTxs(pendingCh)
 	go func() {
 		defer sub.Unsubscribe()
-		for txEvent := range txCh {
+		for txs := range pendingCh {
 			header := eth.blockchain.CurrentHeader()
 			stateAtHead, _ := eth.blockchain.StateAt(header.Root)
-			for _, tx := range txEvent.Txs {
+			for _, tx := range txs {
 				// Skip own outgoing transactions
 				signer := types.LatestSigner(eth.blockchain.Config())
 				from, err := types.Sender(signer, tx)
