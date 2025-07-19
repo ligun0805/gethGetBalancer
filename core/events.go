@@ -17,11 +17,16 @@
 package core
 
 import (
+	"time"
+
 	"github.com/ethereum/go-ethereum/core/types"
 )
 
 // NewTxsEvent is posted when a batch of transactions enter the transaction pool.
-type NewTxsEvent struct{ Txs []*types.Transaction }
+type NewTxsEvent struct {
+	Txs   []*types.Transaction // the transactions themselves
+	Times []time.Time          // time of first appearance of each tx in the pool
+}
 
 // RemovedLogsEvent is posted when a reorg happens
 type RemovedLogsEvent struct{ Logs []*types.Log }

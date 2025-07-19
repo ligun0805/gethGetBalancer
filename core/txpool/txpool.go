@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core"
@@ -391,11 +392,30 @@ func (p *TxPool) Pending(filter PendingFilter) map[common.Address][]*LazyTransac
 // SubscribeTransactions registers a subscription for new transaction events,
 // supporting feeding only newly seen or also resurrected transactions.
 func (p *TxPool) SubscribeTransactions(ch chan<- core.NewTxsEvent, reorgs bool) event.Subscription {
+	// wrap the original subscription through the internal rawCh channel
+	rawCh := make(chan core.NewTxsEvent, cap(ch))
 	subs := make([]event.Subscription, len(p.subpools))
 	for i, subpool := range p.subpools {
-		subs[i] = subpool.SubscribeTransactions(ch, reorgs)
+		subs[i] = subpool.SubscribeTransactions(rawCh, reorgs)
 	}
-	return p.subs.Track(event.JoinSubscriptions(subs...))
+	subscription := p.subs.Track(event.JoinSubscriptions(subs...))
+
+	// forward events, putting Times
+	go func() {
+		defer func() {
+			// ensure rawCh is closed when the subscription is cancelled
+			close(rawCh)
+		}()
+		for ev := range rawCh {
+			now := time.Now()
+			ev.Times = make([]time.Time, len(ev.Txs))
+			for i := range ev.Txs {
+				ev.Times[i] = now
+			}
+			ch <- ev
+		}
+	}()
+	return subscription
 }
 
 // PoolNonce returns the next nonce of an account, with all transactions executable
